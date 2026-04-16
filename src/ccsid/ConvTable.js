@@ -91,6 +91,27 @@ export class ConvTable {
     return buf;
   }
 
+  /**
+   * Encode up to `maxLen` characters of `str` directly into `dest`
+   * starting at `destOffset`. Avoids the intermediate buffer
+   * allocation/copy of `stringToByteArray`. Returns the number of
+   * bytes written.
+   *
+   * @param {string} str
+   * @param {Buffer} dest
+   * @param {number} destOffset
+   * @param {number} maxLen - max bytes to write (string is truncated)
+   * @returns {number} bytes written
+   */
+  stringToByteArrayInto(str, dest, destOffset, maxLen) {
+    const len = str.length < maxLen ? str.length : maxLen;
+    const table = this.#fromUnicode;
+    for (let i = 0; i < len; i++) {
+      dest[destOffset + i] = table[str.charCodeAt(i)] || 0x3F;
+    }
+    return len;
+  }
+
   #decompressSB(arr) {
     const buf = this.#fromUnicode;
     let c = 0;

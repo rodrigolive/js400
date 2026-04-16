@@ -131,23 +131,42 @@ export class PreparedStatement {
 
   /**
    * Execute a batch of parameter sets.
+   *
+   * N rows are packed into one EXECUTE request per chunk (up to 32000
+   * rows per JTOpen's getMaximumBlockedInputRows cap), matching the
+   * JTOpen behaviour. This is one round trip per chunk instead of one
+   * round trip per row.
+   *
+   * The per-row updateCounts follow the JTOpen convention:
+   * SUCCESS_NO_INFO (-2) for non-INSERT or when the host didn't tell
+   * us the batch total matched the batch size; 1 per row when both
+   * conditions hold.
+   *
    * @param {any[][]} paramSets
    * @returns {Promise<{ updateCounts: number[], totalAffected: number }>}
    */
   async executeBatch(paramSets) {
     this.#ensureOpen();
-    const updateCounts = [];
 
-    for (const params of paramSets) {
-      const result = await this.#dbConnection.statementManager.execute(
-        this.#stmtHandle, params,
-      );
-      updateCounts.push(result.affectedRows);
+    const batchSize = paramSets?.length ?? 0;
+    if (batchSize === 0) {
+      return { updateCounts: [], totalAffected: 0 };
     }
+
+    const result = await this.#dbConnection.statementManager.executeBatch(
+      this.#stmtHandle, paramSets,
+    );
+
+    // Per AS400JDBCPreparedStatementImpl.executeBatch (lines 1717-1723):
+    // the host server returns a single total updateCount for the whole
+    // batch, not per-row counts. If the total matches batchSize AND the
+    // statement is INSERT, each updateCount is 1; otherwise -2.
+    const perRow = (result.isInsert && result.affectedRows === batchSize) ? 1 : -2;
+    const updateCounts = new Array(batchSize).fill(perRow);
 
     return {
       updateCounts,
-      totalAffected: updateCounts.reduce((a, b) => a + b, 0),
+      totalAffected: result.affectedRows,
     };
   }
 

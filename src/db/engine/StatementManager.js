@@ -172,6 +172,10 @@ export class StatementManager {
       paramCount: paramDescriptors.length,
       columnCount: columnDescriptors.length,
       descriptorHandle: 0,  // set at first execute via changeDescriptor
+      // Widths last sent to the server via changeDescriptor. Used by
+      // executeBatch to avoid a redundant changeDescriptor RTT when
+      // successive batches have the same field widths.
+      lastSentWidths: null,
       closed: false,
     };
 
@@ -289,22 +293,157 @@ export class StatementManager {
   }
 
   /**
-   * Execute a batch of parameter sets.
+   * Execute a batch of parameter sets in a single round trip per chunk.
+   *
+   * Per JTOpen AS400JDBCPreparedStatementImpl.executeBatch, N rows are
+   * packed into one DBOriginalData (0x3811) code point with rowCount=N,
+   * then sent in one EXECUTE (0x1805) request. The server returns a
+   * single SQLCA whose rowCount is the total rows inserted across the
+   * batch. This collapses 2N round trips (single-row path) into 2 per
+   * chunk (changeDescriptor + execute).
+   *
+   * Batches larger than MAX_BLOCKED_ROWS are split into chunks, mirroring
+   * JTOpen's getMaximumBlockedInputRows() 32_000-row cap.
+   *
    * @param {PreparedStatementHandle} stmt
    * @param {any[][]} paramSets
-   * @returns {Promise<{ affectedRows: number, sqlca: object }>}
+   * @returns {Promise<{ affectedRows: number, sqlca: object, batchSize: number, isInsert: boolean }>}
    */
   async executeBatch(stmt, paramSets) {
+    if (stmt.closed) throw new Error('Statement is closed');
+
+    const batchSize = paramSets?.length ?? 0;
+    if (batchSize === 0) {
+      return { affectedRows: 0, sqlca: null, batchSize: 0, isInsert: false };
+    }
+
+    if (stmt.paramDescriptors.length === 0) {
+      // No parameters — just execute once and ignore the "batch".
+      const result = await this.execute(stmt, []);
+      return {
+        affectedRows: result.affectedRows,
+        sqlca: result.sqlca,
+        batchSize: 1,
+        isInsert: inferStatementType(stmt.sql) === StatementType.OTHER,
+      };
+    }
+
+    // Pre-encode every value once. We need the encoded buffers both to
+    // size resizable (VARCHAR-family) columns and to pack the data block.
+    // Memory: roughly paramSets.length × paramCount × avg 40 bytes.
+    const paramCount = stmt.paramDescriptors.length;
+    const encodedRows = new Array(batchSize);
+    const nullRows = new Array(batchSize);
+
+    // Track the widest encoded length per column for resizable types.
+    // For fixed-width types this is unused.
+    const maxFieldLen = new Array(paramCount).fill(0);
+    const isResizable = new Array(paramCount);
+    for (let c = 0; c < paramCount; c++) {
+      isResizable[c] = isResizableParameterType(stmt.paramDescriptors[c].sqlType);
+    }
+
+    for (let r = 0; r < batchSize; r++) {
+      const params = paramSets[r];
+      const encoded = new Array(paramCount);
+      const nulls = new Uint8Array(paramCount);
+      for (let c = 0; c < paramCount; c++) {
+        const v = params?.[c];
+        if (v === null || v === undefined) {
+          nulls[c] = 1;
+          encoded[c] = null;
+          continue;
+        }
+        const desc = stmt.paramDescriptors[c];
+        const buf = encodeValue(v, desc, this.#serverCCSID);
+        encoded[c] = buf;
+        if (isResizable[c] && buf.length > maxFieldLen[c]) {
+          maxFieldLen[c] = buf.length;
+        }
+      }
+      encodedRows[r] = encoded;
+      nullRows[r] = nulls;
+    }
+
+    // Build batch-width descriptors. For resizable columns, length is
+    // max(encoded - 2) across the batch (2-byte length prefix). For
+    // fixed columns, copy from the server descriptor.
+    const batchDescriptors = new Array(paramCount);
+    let paramRecordSize = 0;
+    for (let c = 0; c < paramCount; c++) {
+      const src = stmt.paramDescriptors[c];
+      if (isResizable[c]) {
+        // Cap at the server-described maximum; a VARCHAR(50) column
+        // cannot accept a 51-byte value, but also never needs more.
+        const serverMax = src.length;
+        const wanted = Math.max(0, maxFieldLen[c] - 2);
+        const chosen = Math.min(serverMax, wanted);
+        batchDescriptors[c] = { ...src, length: chosen, rawFieldLength: 2 + chosen };
+      } else {
+        batchDescriptors[c] = src;
+      }
+      paramRecordSize += getColumnByteLength(batchDescriptors[c]);
+    }
+
+    // Send the change-descriptor only when widths actually change.
+    // On subsequent batches with the same schema we can skip this RTT;
+    // the server still remembers the widths from the previous batch.
+    // For typical bulk inserts of fixed-width rows this saves one RTT
+    // per chunk after the first.
+    if (stmt.descriptorHandle === 0) {
+      stmt.descriptorHandle = stmt.rpbId;
+    }
+    const widthsSig = batchDescriptors.map(d => d.length).join(',');
+    if (stmt.lastSentWidths !== widthsSig) {
+      const cdBuf = DBRequestDS.buildChangeDescriptor({
+        rpbId: stmt.rpbId,
+        descriptorHandle: stmt.descriptorHandle,
+        descriptors: batchDescriptors,
+        recordSize: paramRecordSize,
+      });
+      const cdReplyBuf = await this.#connection.sendAndReceive(cdBuf);
+      const cdReply = parseOperationReply(cdReplyBuf, { serverCCSID: this.#serverCCSID });
+      throwIfError(cdReply.sqlca, 'Change descriptor (batch)');
+      stmt.lastSentWidths = widthsSig;
+    }
+
+    const isInsert = inferStatementType(stmt.sql) === StatementType.OTHER
+      && /^\s*(?:--[^\n]*\n|\/\*[\s\S]*?\*\/|\s)*INSERT\b/i.test(stmt.sql);
+
+    // JTOpen's getMaximumBlockedInputRows() caps batched inserts at
+    // 32000 rows per request. Split large batches to match.
+    const MAX_CHUNK = 32_000;
     let totalAffected = 0;
     let lastSqlca = null;
 
-    for (const params of paramSets) {
-      const result = await this.execute(stmt, params);
-      totalAffected += result.affectedRows;
-      lastSqlca = result.sqlca;
+    for (let chunkStart = 0; chunkStart < batchSize; chunkStart += MAX_CHUNK) {
+      const chunkEnd = Math.min(chunkStart + MAX_CHUNK, batchSize);
+      const chunkRowCount = chunkEnd - chunkStart;
+
+      const parameterMarkerData = this.#encodeParametersBatch(
+        encodedRows, nullRows, batchDescriptors, chunkStart, chunkRowCount, paramRecordSize,
+      );
+
+      const reqBuf = DBRequestDS.buildExecute({
+        rpbId: stmt.rpbId,
+        parameterMarkerData,
+        pmDescriptorHandle: stmt.descriptorHandle,
+      });
+
+      const replyBuf = await this.#connection.sendAndReceive(reqBuf);
+      const reply = parseOperationReply(replyBuf, { serverCCSID: this.#serverCCSID });
+      throwIfError(reply.sqlca, 'Execute (batch)');
+
+      totalAffected += reply.sqlca.rowCount || 0;
+      lastSqlca = reply.sqlca;
     }
 
-    return { affectedRows: totalAffected, sqlca: lastSqlca };
+    return {
+      affectedRows: totalAffected,
+      sqlca: lastSqlca,
+      batchSize,
+      isInsert,
+    };
   }
 
   /**
@@ -428,6 +567,100 @@ export class StatementManager {
       descriptors: plannedDescriptors,
       encodedValues,
     };
+  }
+
+  /**
+   * Encode N rows of parameters into a single DBOriginalData buffer
+   * (code point 0x3811). Mirrors the DBOriginalData header layout
+   * from JTOpen:
+   *
+   *   Header (14 bytes):
+   *     +0:  int32 consistencyToken (= 1)
+   *     +4:  int32 rowCount
+   *     +8:  int16 columnCount
+   *     +10: int16 indicatorSize (= 2)
+   *     +12: int16 rowSize          (data bytes per row, no indicators)
+   *   Indicators: rowCount * columnCount * 2 bytes, row-major
+   *     0 = value present, -1 (0xFFFF) = SQL NULL
+   *   Data: rowCount * rowSize bytes
+   *     Each row is a packed sequence of fixed-width fields, VARCHAR
+   *     family columns written as 2-byte length prefix + data padded
+   *     to the descriptor length.
+   *
+   * @param {Array<Buffer|null>[]} encodedRows - one inner array per row
+   * @param {Uint8Array[]} nullRows - 1 = null column, 0 = value
+   * @param {object[]} descriptors - batch-width descriptors
+   * @param {number} rowStart - index into encodedRows for start of chunk
+   * @param {number} rowCount - number of rows in this chunk
+   * @param {number} rowSize - bytes per row (excluding indicators)
+   * @returns {Buffer}
+   */
+  #encodeParametersBatch(encodedRows, nullRows, descriptors, rowStart, rowCount, rowSize) {
+    const columnCount = descriptors.length;
+    const indicatorSize = 2;
+    const headerSize = 14;
+    const indicatorBlockSize = rowCount * columnCount * indicatorSize;
+    const dataBlockSize = rowCount * rowSize;
+    const totalSize = headerSize + indicatorBlockSize + dataBlockSize;
+
+    // allocUnsafe is safe here: the header, indicator block, and data
+    // block are fully overwritten below. VARCHAR padding is written
+    // explicitly (we zero the unused tail per field below).
+    const buf = Buffer.allocUnsafe(totalSize);
+
+    // Header
+    buf.writeInt32BE(1, 0);                     // consistencyToken
+    buf.writeInt32BE(rowCount, 4);              // rowCount
+    buf.writeInt16BE(columnCount, 8);           // columnCount
+    buf.writeInt16BE(indicatorSize, 10);        // indicatorSize
+    buf.writeInt16BE(rowSize, 12);              // rowSize (data only)
+
+    // Pre-compute per-column offsets within a row.
+    const colOffsets = new Array(columnCount);
+    const colByteLens = new Array(columnCount);
+    let off = 0;
+    for (let c = 0; c < columnCount; c++) {
+      colOffsets[c] = off;
+      const fieldLen = getColumnByteLength(descriptors[c]);
+      colByteLens[c] = fieldLen;
+      off += fieldLen;
+    }
+
+    const indicatorStart = headerSize;
+    const dataStart = headerSize + indicatorBlockSize;
+
+    for (let r = 0; r < rowCount; r++) {
+      const srcRow = encodedRows[rowStart + r];
+      const nulls = nullRows[rowStart + r];
+      const indRowBase = indicatorStart + r * columnCount * indicatorSize;
+      const rowDataBase = dataStart + r * rowSize;
+
+      for (let c = 0; c < columnCount; c++) {
+        const fieldLen = colByteLens[c];
+        const fieldStart = rowDataBase + colOffsets[c];
+
+        if (nulls[c]) {
+          buf.writeInt16BE(-1, indRowBase + c * indicatorSize);
+          // Zero the data slot so we don't leak allocUnsafe bytes.
+          buf.fill(0, fieldStart, fieldStart + fieldLen);
+          continue;
+        }
+
+        buf.writeInt16BE(0, indRowBase + c * indicatorSize);
+        const encoded = srcRow[c];
+        if (encoded.length >= fieldLen) {
+          encoded.copy(buf, fieldStart, 0, fieldLen);
+        } else {
+          // Fixed-width field with a short encoded buffer: copy and
+          // zero-pad the tail. For VARCHAR this is the normal case
+          // (copy 2-byte length + data, pad remainder to desc.length).
+          encoded.copy(buf, fieldStart, 0, encoded.length);
+          buf.fill(0, fieldStart + encoded.length, fieldStart + fieldLen);
+        }
+      }
+    }
+
+    return buf;
   }
 
   #encodeParameters(params, descriptors, encodedValues = []) {

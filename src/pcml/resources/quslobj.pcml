@@ -1,0 +1,23 @@
+<!--///////////////////////////////////////////////////////////////////////////
+//
+// PCML source for js400 - IBM i API bindings
+//
+// Filename: quslobj.pcml
+//
+// API: QUSLOBJ - List Objects
+//
+////////////////////////////////////////////////////////////////////////////-->
+
+<pcml version="1.0">
+
+<!-- PCML source for calling "List Objects" (QUSLOBJ) API -->
+
+  <program name="quslobj" path="/QSYS.lib/QUSLOBJ.pgm">
+    <data name="qualifiedUserSpaceName" type="char" length="20" usage="input"/>
+    <data name="formatName"             type="char" length="8"  usage="input" init="OBJL0100"/>
+    <data name="qualifiedObjectName"    type="char" length="20" usage="input"/>
+    <data name="objectType"             type="char" length="10" usage="input"/>
+    <data name="errorCode"              type="int"  length="4"  usage="input" init="0"/>
+  </program>
+
+</pcml>

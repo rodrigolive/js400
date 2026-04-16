@@ -1,0 +1,20 @@
+<!--///////////////////////////////////////////////////////////////////////////
+//
+// PCML source for js400 - IBM i API bindings
+//
+// Filename: qusdltus.pcml
+//
+// API: QUSDLTUS - Delete User Space
+//
+////////////////////////////////////////////////////////////////////////////-->
+
+<pcml version="1.0">
+
+<!-- PCML source for calling "Delete User Space" (QUSDLTUS) API -->
+
+  <program name="qusdltus" path="/QSYS.lib/QUSDLTUS.pgm">
+    <data name="qualifiedUserSpaceName" type="char" length="20" usage="input"/>
+    <data name="errorCode"              type="int"  length="4"  usage="input" init="0"/>
+  </program>
+
+</pcml>

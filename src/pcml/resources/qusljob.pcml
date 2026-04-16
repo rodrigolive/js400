@@ -1,0 +1,23 @@
+<!--///////////////////////////////////////////////////////////////////////////
+//
+// PCML source for js400 - IBM i API bindings
+//
+// Filename: qusljob.pcml
+//
+// API: QUSLJOB - List Jobs
+//
+////////////////////////////////////////////////////////////////////////////-->
+
+<pcml version="1.0">
+
+<!-- PCML source for calling "List Jobs" (QUSLJOB) API -->
+
+  <program name="qusljob" path="/QSYS.lib/QUSLJOB.pgm">
+    <data name="qualifiedUserSpaceName" type="char" length="20" usage="input"/>
+    <data name="formatName"             type="char" length="8"  usage="input" init="JOBL0100"/>
+    <data name="qualifiedJobName"       type="char" length="26" usage="input"/>
+    <data name="status"                 type="char" length="10" usage="input" init="*ALL"/>
+    <data name="errorCode"              type="int"  length="4"  usage="input" init="0"/>
+  </program>
+
+</pcml>

@@ -1,0 +1,26 @@
+<!--///////////////////////////////////////////////////////////////////////////
+//
+// PCML source for js400 - IBM i API bindings
+//
+// Filename: quscrtus.pcml
+//
+// API: QUSCRTUS - Create User Space
+//
+////////////////////////////////////////////////////////////////////////////-->
+
+<pcml version="1.0">
+
+<!-- PCML source for calling "Create User Space" (QUSCRTUS) API -->
+
+  <program name="quscrtus" path="/QSYS.lib/QUSCRTUS.pgm">
+    <data name="qualifiedUserSpaceName" type="char" length="20" usage="input"/>
+    <data name="extendedAttribute"      type="char" length="10" usage="input" init="USRSPC"/>
+    <data name="initialSize"            type="int"  length="4"  usage="input" init="4096"/>
+    <data name="initialValue"           type="char" length="1"  usage="input" init=" "/>
+    <data name="publicAuthority"        type="char" length="10" usage="input" init="*CHANGE"/>
+    <data name="textDescription"        type="char" length="50" usage="input"/>
+    <data name="replace"                type="char" length="10" usage="input" init="*YES"/>
+    <data name="errorCode"              type="int"  length="4"  usage="input" init="0"/>
+  </program>
+
+</pcml>

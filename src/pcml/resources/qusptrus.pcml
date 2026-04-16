@@ -1,0 +1,21 @@
+<!--///////////////////////////////////////////////////////////////////////////
+//
+// PCML source for js400 - IBM i API bindings
+//
+// Filename: qusptrus.pcml
+//
+// API: QUSPTRUS - Retrieve Pointer to User Space
+//
+////////////////////////////////////////////////////////////////////////////-->
+
+<pcml version="1.0">
+
+<!-- PCML source for calling "Retrieve Pointer to User Space" (QUSPTRUS) API -->
+
+  <program name="qusptrus" path="/QSYS.lib/QUSPTRUS.pgm">
+    <data name="qualifiedUserSpaceName" type="char" length="20" usage="input"/>
+    <data name="pointer"                type="byte" length="16" usage="output"/>
+    <data name="errorCode"              type="int"  length="4"  usage="input" init="0"/>
+  </program>
+
+</pcml>

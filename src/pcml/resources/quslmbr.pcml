@@ -1,0 +1,24 @@
+<!--///////////////////////////////////////////////////////////////////////////
+//
+// PCML source for js400 - IBM i API bindings
+//
+// Filename: quslmbr.pcml
+//
+// API: QUSLMBR - List Database File Members
+//
+////////////////////////////////////////////////////////////////////////////-->
+
+<pcml version="1.0">
+
+<!-- PCML source for calling "List Database File Members" (QUSLMBR) API -->
+
+  <program name="quslmbr" path="/QSYS.lib/QUSLMBR.pgm">
+    <data name="qualifiedUserSpaceName" type="char" length="20" usage="input"/>
+    <data name="formatName"             type="char" length="8"  usage="input" init="MBRL0100"/>
+    <data name="qualifiedFileName"      type="char" length="20" usage="input"/>
+    <data name="memberName"             type="char" length="10" usage="input" init="*ALL"/>
+    <data name="overrideProcessing"     type="char" length="1"  usage="input" init="0"/>
+    <data name="errorCode"              type="int"  length="4"  usage="input" init="0"/>
+  </program>
+
+</pcml>

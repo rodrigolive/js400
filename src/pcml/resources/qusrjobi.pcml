@@ -1,0 +1,33 @@
+<!--///////////////////////////////////////////////////////////////////////////
+//
+// PCML source for js400 - IBM i API bindings
+//
+// Filename: qusrjobi.pcml
+//
+// API: QUSRJOBI - Retrieve Job Information
+//
+////////////////////////////////////////////////////////////////////////////-->
+
+<pcml version="1.0">
+
+<!-- PCML source for calling "Retrieve Job Information" (QUSRJOBI) API -->
+
+  <!-- Format JOBI0100 -->
+  <struct name="jobi0100">
+    <data name="bytesReturned"  type="int"  length="4"  usage="output"/>
+    <data name="bytesAvailable" type="int"  length="4"  usage="output"/>
+    <data name="jobName"        type="char" length="10" usage="output"/>
+    <data name="userName"       type="char" length="10" usage="output"/>
+    <data name="jobNumber"      type="char" length="6"  usage="output"/>
+  </struct>
+
+  <program name="qusrjobi" path="/QSYS.lib/QUSRJOBI.pgm">
+    <data name="receiver"       type="struct"           usage="output" struct="jobi0100"/>
+    <data name="receiverLength" type="int"  length="4"  usage="input"  init="86"/>
+    <data name="formatName"     type="char" length="8"  usage="input"  init="JOBI0100"/>
+    <data name="qualifiedJobName" type="char" length="26" usage="input"/>
+    <data name="internalJobId"  type="char" length="16" usage="input"/>
+    <data name="errorCode"      type="int"  length="4"  usage="input"  init="0"/>
+  </program>
+
+</pcml>

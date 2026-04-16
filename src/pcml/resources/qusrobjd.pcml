@@ -1,0 +1,30 @@
+<!--///////////////////////////////////////////////////////////////////////////
+//
+// PCML source for js400 - IBM i API bindings
+//
+// Filename: qusrobjd.pcml
+//
+// API: QUSROBJD - Retrieve Object Description
+//
+////////////////////////////////////////////////////////////////////////////-->
+
+<pcml version="1.0">
+
+<!-- PCML source for calling "Retrieve Object Description" (QUSROBJD) API -->
+
+  <!-- Format OBJD0100 -->
+  <struct name="objd0100">
+    <data name="bytesReturned"  type="int"  length="4"  usage="output"/>
+    <data name="bytesAvailable" type="int"  length="4"  usage="output"/>
+  </struct>
+
+  <program name="qusrobjd" path="/QSYS.lib/QUSROBJD.pgm">
+    <data name="receiver"       type="struct"           usage="output" struct="objd0100"/>
+    <data name="receiverLength" type="int"  length="4"  usage="input"  init="100"/>
+    <data name="formatName"     type="char" length="8"  usage="input"  init="OBJD0100"/>
+    <data name="qualifiedObjectName" type="char" length="20" usage="input"/>
+    <data name="objectType"     type="char" length="10" usage="input"/>
+    <data name="errorCode"      type="int"  length="4"  usage="input"  init="0"/>
+  </program>
+
+</pcml>

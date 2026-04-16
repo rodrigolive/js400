@@ -1,0 +1,30 @@
+<!--///////////////////////////////////////////////////////////////////////////
+//
+// PCML source for js400 - IBM i API bindings
+//
+// Filename: qusrusat.pcml
+//
+// API: QUSRUSAT - Retrieve User Space Attributes
+//
+////////////////////////////////////////////////////////////////////////////-->
+
+<pcml version="1.0">
+
+<!-- PCML source for calling "Retrieve User Space Attributes" (QUSRUSAT) API -->
+
+  <!-- Format SPCA0100 -->
+  <struct name="spca0100">
+    <data name="bytesReturned"  type="int" length="4" usage="output"/>
+    <data name="bytesAvailable" type="int" length="4" usage="output"/>
+    <data name="spaceSize"      type="int" length="4" usage="output"/>
+  </struct>
+
+  <program name="qusrusat" path="/QSYS.lib/QUSRUSAT.pgm">
+    <data name="receiver"       type="struct"          usage="output" struct="spca0100"/>
+    <data name="receiverLength" type="int"  length="4" usage="input"  init="100"/>
+    <data name="formatName"     type="char" length="8" usage="input"  init="SPCA0100"/>
+    <data name="qualifiedUserSpaceName" type="char" length="20" usage="input"/>
+    <data name="errorCode"      type="int"  length="4" usage="input"  init="0"/>
+  </program>
+
+</pcml>

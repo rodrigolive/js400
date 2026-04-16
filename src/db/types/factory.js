@@ -1,0 +1,279 @@
+/**
+ * SQL type factory — maps server descriptor type codes to decoder/encoder functions.
+ *
+ * Upstream: SQLDataFactory.java, SQLNativeType.java
+ * @module db/types/factory
+ */
+
+import { numericTypes } from './numeric.js';
+import { stringTypes } from './string.js';
+import { binaryTypes } from './binary.js';
+import { datetimeTypes } from './datetime.js';
+import { lobTypes } from './lob.js';
+import { specialTypes } from './special.js';
+
+const allTypes = new Map();
+
+function registerAll(typeMap) {
+  for (const [key, handler] of Object.entries(typeMap)) {
+    allTypes.set(Number(key), handler);
+  }
+}
+
+registerAll(numericTypes);
+registerAll(stringTypes);
+registerAll(binaryTypes);
+registerAll(datetimeTypes);
+registerAll(lobTypes);
+registerAll(specialTypes);
+
+/**
+ * Look up a type handler by the server's SQL type code.
+ * The type code is the absolute value with the low bit masked off
+ * (the low bit indicates nullable).
+ *
+ * @param {number} sqlType - SQL type code from column descriptor
+ * @returns {{ decode: Function, encode: Function, name: string } | null}
+ */
+export function getTypeHandler(sqlType) {
+  const key = Math.abs(sqlType) & 0xFFFE;
+  return allTypes.get(key) ?? null;
+}
+
+/**
+ * Decode a column value from a row data buffer.
+ *
+ * @param {Buffer} buf - row data buffer
+ * @param {number} offset - byte offset to start reading
+ * @param {object} descriptor - column descriptor from DBDescriptors
+ * @param {number} [serverCCSID=37]
+ * @returns {{ value: any, bytesRead: number }}
+ */
+export function decodeValue(buf, offset, descriptor, serverCCSID = 37) {
+  const handler = getTypeHandler(descriptor.sqlType);
+  if (!handler) {
+    return { value: null, bytesRead: descriptor.length || 0 };
+  }
+  return handler.decode(buf, offset, descriptor, serverCCSID);
+}
+
+/**
+ * Encode a JS value into a buffer for a parameter marker.
+ *
+ * @param {any} value - JS value to encode
+ * @param {object} descriptor - parameter descriptor
+ * @param {number} [serverCCSID=37]
+ * @returns {Buffer}
+ */
+export function encodeValue(value, descriptor, serverCCSID = 37) {
+  const handler = getTypeHandler(descriptor.sqlType);
+  if (!handler) {
+    throw new Error(`No encoder for SQL type ${descriptor.sqlType}`);
+  }
+  return handler.encode(value, descriptor, serverCCSID);
+}
+
+/**
+ * Decode an entire row from a buffer given column descriptors.
+ *
+ * @param {Buffer} buf - row data
+ * @param {number} startOffset
+ * @param {object[]} descriptors - column descriptors array
+ * @param {number} [serverCCSID=37]
+ * @returns {{ row: object, bytesRead: number }}
+ */
+export function decodeRow(buf, startOffset, descriptors, serverCCSID = 37) {
+  const row = {};
+  let offset = startOffset;
+
+  for (const desc of descriptors) {
+    // Check null indicator (2 bytes) for nullable columns
+    if (desc.nullable) {
+      if (offset + 2 > buf.length) break;
+      const nullInd = buf.readInt16BE(offset);
+      offset += 2;
+      if (nullInd === -1) {
+        row[desc.name || `col${desc.index}`] = null;
+        // Skip past the data bytes
+        const handler = getTypeHandler(desc.sqlType);
+        if (handler) {
+          const skip = handler.decode(buf, offset, desc, serverCCSID);
+          offset += skip.bytesRead;
+        }
+        continue;
+      }
+    }
+
+    const { value, bytesRead } = decodeValue(buf, offset, desc, serverCCSID);
+    row[desc.name || `col${desc.index}`] = value;
+    offset += bytesRead;
+  }
+
+  return { row, bytesRead: offset - startOffset };
+}
+
+/**
+ * Decode multiple rows from a buffer.
+ *
+ * @param {Buffer} buf
+ * @param {number} startOffset
+ * @param {object[]} descriptors
+ * @param {number} rowCount
+ * @param {number} [serverCCSID=37]
+ * @returns {object[]}
+ */
+export function decodeRows(buf, startOffset, descriptors, rowCount, serverCCSID = 37) {
+  const rows = [];
+  let offset = startOffset;
+
+  for (let i = 0; i < rowCount; i++) {
+    if (offset >= buf.length) break;
+    const { row, bytesRead } = decodeRow(buf, offset, descriptors, serverCCSID);
+    rows.push(row);
+    offset += bytesRead;
+  }
+
+  return rows;
+}
+
+/**
+ * Decode result data from a 0x380E or 0x3806 code point buffer.
+ *
+ * Two header formats exist depending on datastream level:
+ *
+ *   DS level >= 1 (CP 0x380E) — 20-byte header:
+ *     0-3:   consistencyToken (int32)
+ *     4-7:   rowCount (int32)
+ *     8-9:   columnCount (int16)
+ *     10-11: indicatorSize (int16, typically 2)
+ *     12-15: reserved (int32)
+ *     16-19: rowSize (int32, data bytes per row, NO indicators)
+ *
+ *   DS level 0 (CP 0x3806) — 14-byte header:
+ *     0-3:   consistencyToken (int32)
+ *     4-7:   rowCount (int32)
+ *     8-9:   columnCount (int16)
+ *     10-11: indicatorSize (int16, typically 2)
+ *     12-13: rowSize (int16, data bytes per row, NO indicators)
+ *
+ *   Indicators block: rowCount * columnCount * indicatorSize bytes
+ *   Data block:       rowCount * rowSize bytes
+ *
+ * Indicators are SEPARATE from row data (not interleaved).
+ * An indicator value of -1 means null.
+ *
+ * @param {Buffer} buf - raw result data code point data (after LL/CP)
+ * @param {object[]} descriptors - column descriptors from prepare
+ * @param {number} [serverCCSID=37]
+ * @returns {object[]}
+ */
+export function decodeResultData(buf, descriptors, serverCCSID = 37) {
+  if (!buf || buf.length < 14) return [];
+
+  const rowCount = buf.readInt32BE(4);
+  const columnCount = buf.readInt16BE(8);
+  const indicatorSize = buf.readInt16BE(10);
+
+  // Detect header format by validating against the total buffer size.
+  // 14-byte header (DS level 0, CP 0x3806): rowSize at offset 12 as int16
+  // 20-byte header (DS level >= 1, CP 0x380E): rowSize at offset 16 as int32
+  // The correct format is the one where header + indicators + data == bufLen.
+  let headerSize;
+  let rowSize;
+  const indBlock = rowCount * columnCount * indicatorSize;
+  const rowSize14 = buf.readUInt16BE(12);
+  const expected14 = 14 + indBlock + rowCount * rowSize14;
+  if (expected14 === buf.length && rowSize14 > 0) {
+    headerSize = 14;
+    rowSize = rowSize14;
+  } else if (buf.length >= 20) {
+    const rowSize20 = buf.readInt32BE(16);
+    const expected20 = 20 + indBlock + rowCount * rowSize20;
+    if (expected20 === buf.length && rowSize20 > 0) {
+      headerSize = 20;
+      rowSize = rowSize20;
+    } else {
+      // Fallback: use whichever header size yields a valid layout
+      headerSize = 14;
+      rowSize = rowSize14;
+    }
+  } else {
+    headerSize = 14;
+    rowSize = rowSize14;
+  }
+
+  if (rowCount <= 0 || columnCount <= 0 || rowSize <= 0) return [];
+  const indicatorBlockSize = rowCount * columnCount * indicatorSize;
+  const indicatorStart = headerSize;
+  const dataStart = headerSize + indicatorBlockSize;
+
+  const rows = [];
+  const descCount = Math.min(columnCount, descriptors.length);
+
+  // Pre-compute column offsets within a row
+  const colOffsets = new Array(descCount);
+  let off = 0;
+  for (let c = 0; c < descCount; c++) {
+    colOffsets[c] = off;
+    const handler = getTypeHandler(descriptors[c].sqlType);
+    if (handler) {
+      // Probe decode to determine byte width (use first row area or estimate)
+      const absType = Math.abs(descriptors[c].sqlType) & 0xFFFE;
+      switch (absType) {
+        case 500: off += 2; break;  // SMALLINT
+        case 496: off += 4; break;  // INTEGER
+        case 492: off += 8; break;  // BIGINT
+        case 480: off += (descriptors[c].length === 4 ? 4 : 8); break; // FLOAT
+        case 452: case 468: off += descriptors[c].length; break; // CHAR/GRAPHIC
+        case 448: case 464: case 456: case 472: off += 2 + descriptors[c].length; break; // VARCHAR etc
+        case 484: case 488: off += descriptors[c].length; break; // DECIMAL/NUMERIC
+        case 912: off += descriptors[c].length; break; // BINARY
+        case 908: off += 2 + descriptors[c].length; break; // VARBINARY
+        case 384: case 388: case 392: off += descriptors[c].length; break; // DATE/TIME/TIMESTAMP
+        case 996: off += descriptors[c].length; break; // DECFLOAT
+        default: off += descriptors[c].length || 0; break;
+      }
+    } else {
+      off += descriptors[c].length || 0;
+    }
+  }
+
+  for (let r = 0; r < rowCount; r++) {
+    const rowDataOffset = dataStart + r * rowSize;
+    if (rowDataOffset + rowSize > buf.length) break;
+
+    const row = {};
+    for (let c = 0; c < descCount; c++) {
+      const desc = descriptors[c];
+      const name = desc.name || `col${desc.index}`;
+
+      // Read indicator
+      const indOffset = indicatorStart + (r * columnCount + c) * indicatorSize;
+      let isNull = false;
+      if (indicatorSize === 2 && indOffset + 2 <= buf.length) {
+        isNull = buf.readInt16BE(indOffset) === -1;
+      }
+
+      if (isNull) {
+        row[name] = null;
+      } else {
+        const valOffset = rowDataOffset + colOffsets[c];
+        const { value } = decodeValue(buf, valOffset, desc, serverCCSID);
+        row[name] = value;
+      }
+    }
+
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+export class SqlTypeFactory {
+  static getTypeHandler = getTypeHandler;
+  static decodeValue = decodeValue;
+  static encodeValue = encodeValue;
+  static decodeRow = decodeRow;
+  static decodeRows = decodeRows;
+  static decodeResultData = decodeResultData;
+}

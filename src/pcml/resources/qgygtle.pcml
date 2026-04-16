@@ -1,0 +1,34 @@
+<!--///////////////////////////////////////////////////////////////////////////
+//
+// PCML source for js400 - IBM i API bindings
+//
+// Filename: qgygtle.pcml
+//
+// API: QGYGTLE - Get List Entries
+//
+////////////////////////////////////////////////////////////////////////////-->
+
+<pcml version="1.0">
+
+<!-- PCML source for calling "Get List Entries" (QGYGTLE) API -->
+
+  <!-- List information structure -->
+  <struct name="listInfo">
+    <data name="totalRecords"    type="int"  length="4" usage="output"/>
+    <data name="recordsReturned" type="int"  length="4" usage="output"/>
+    <data name="firstRecordNum"  type="int"  length="4" usage="output"/>
+    <data name="listInfoLength"  type="int"  length="4" usage="output"/>
+  </struct>
+
+  <program name="qgygtle" path="/QSYS.lib/QGYGTLE.pgm">
+    <data name="receiver"        type="byte"   length="4096" usage="output"/>
+    <data name="receiverLength"  type="int"    length="4"    usage="input" init="4096"/>
+    <data name="requestHandle"   type="int"    length="4"    usage="input"/>
+    <data name="listInformation" type="struct"               usage="output" struct="listInfo"/>
+    <data name="formatName"      type="char"   length="8"    usage="input"/>
+    <data name="numberOfRecords" type="int"    length="4"    usage="input"/>
+    <data name="startingRecord"  type="int"    length="4"    usage="input"/>
+    <data name="errorCode"       type="int"    length="4"    usage="input" init="0"/>
+  </program>
+
+</pcml>

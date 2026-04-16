@@ -1,0 +1,57 @@
+{
+  "name": "js400",
+  "version": "0.1.0",
+  "description": "Pure JavaScript IBM i client library — wire-compatible JTOpen port for Node v20+ and Bun",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./src/index.js",
+  "types": "./types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./datatypes": {
+      "types": "./types/datatypes.d.ts",
+      "default": "./src/datatypes/index.js"
+    },
+    "./pcml": {
+      "types": "./types/pcml.d.ts",
+      "default": "./src/pcml/index.js"
+    },
+    "./db": {
+      "types": "./types/db.d.ts",
+      "default": "./src/db/index.js"
+    },
+    "./print": {
+      "types": "./types/print.d.ts",
+      "default": "./src/print/index.js"
+    },
+    "./record": {
+      "default": "./src/record/index.js"
+    }
+  },
+  "scripts": {
+    "test": "node --import ./tests/bun-test-shim.js --test tests/",
+    "test:bun": "bun test tests/",
+    "test:integration": "bun test tests/integration/",
+    "validate": "bun run src/index.js"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "keywords": [
+    "ibm-i",
+    "as400",
+    "iseries",
+    "jtopen",
+    "db2",
+    "ebcdic"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/user/js400.git"
+  }
+}

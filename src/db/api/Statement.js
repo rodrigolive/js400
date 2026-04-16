@@ -42,6 +42,7 @@ export class Statement {
           cursorManager: this.#dbConnection.cursorManager,
           rpbId: result.rpbId,
           endOfData: result.endOfData,
+          fetchSize: result.blockingFactor ?? 2048,
         });
         const rows = await rs.toArray();
         await rs.close();

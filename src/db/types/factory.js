@@ -210,56 +210,62 @@ export function decodeResultData(buf, descriptors, serverCCSID = 37) {
   const rows = [];
   const descCount = Math.min(columnCount, descriptors.length);
 
-  // Pre-compute column offsets within a row
+  // Pre-resolve column offsets, names, handlers once — avoid per-row Map
+  // lookups and property fallbacks across 8000+ rows.
   const colOffsets = new Array(descCount);
+  const colNames = new Array(descCount);
+  const colHandlers = new Array(descCount);
   let off = 0;
   for (let c = 0; c < descCount; c++) {
+    const desc = descriptors[c];
     colOffsets[c] = off;
-    const handler = getTypeHandler(descriptors[c].sqlType);
-    if (handler) {
-      // Probe decode to determine byte width (use first row area or estimate)
-      const absType = Math.abs(descriptors[c].sqlType) & 0xFFFE;
-      switch (absType) {
-        case 500: off += 2; break;  // SMALLINT
-        case 496: off += 4; break;  // INTEGER
-        case 492: off += 8; break;  // BIGINT
-        case 480: off += (descriptors[c].length === 4 ? 4 : 8); break; // FLOAT
-        case 452: case 468: off += descriptors[c].length; break; // CHAR/GRAPHIC
-        case 448: case 464: case 456: case 472: off += 2 + descriptors[c].length; break; // VARCHAR etc
-        case 484: case 488: off += descriptors[c].length; break; // DECIMAL/NUMERIC
-        case 912: off += descriptors[c].length; break; // BINARY
-        case 908: off += 2 + descriptors[c].length; break; // VARBINARY
-        case 384: case 388: case 392: off += descriptors[c].length; break; // DATE/TIME/TIMESTAMP
-        case 996: off += descriptors[c].length; break; // DECFLOAT
-        default: off += descriptors[c].length || 0; break;
-      }
-    } else {
-      off += descriptors[c].length || 0;
+    colNames[c] = desc.name || `col${desc.index}`;
+    colHandlers[c] = getTypeHandler(desc.sqlType);
+    const absType = Math.abs(desc.sqlType) & 0xFFFE;
+    switch (absType) {
+      case 500: off += 2; break;  // SMALLINT
+      case 496: off += 4; break;  // INTEGER
+      case 492: off += 8; break;  // BIGINT
+      case 480: off += (desc.length === 4 ? 4 : 8); break; // FLOAT
+      case 452: case 468: off += desc.length; break; // CHAR/GRAPHIC
+      case 448: case 464: case 456: case 472: off += 2 + desc.length; break; // VARCHAR etc
+      case 484: case 488: off += desc.length; break; // DECIMAL/NUMERIC
+      case 912: off += desc.length; break; // BINARY
+      case 908: off += 2 + desc.length; break; // VARBINARY
+      case 384: case 388: case 392: off += desc.length; break; // DATE/TIME/TIMESTAMP
+      case 996: off += desc.length; break; // DECFLOAT
+      default: off += desc.length || 0; break;
     }
   }
+
+  const canIndicator = indicatorSize === 2;
 
   for (let r = 0; r < rowCount; r++) {
     const rowDataOffset = dataStart + r * rowSize;
     if (rowDataOffset + rowSize > buf.length) break;
 
     const row = {};
+    const indRowBase = indicatorStart + r * columnCount * indicatorSize;
     for (let c = 0; c < descCount; c++) {
-      const desc = descriptors[c];
-      const name = desc.name || `col${desc.index}`;
+      const name = colNames[c];
+      const handler = colHandlers[c];
 
       // Read indicator
-      const indOffset = indicatorStart + (r * columnCount + c) * indicatorSize;
       let isNull = false;
-      if (indicatorSize === 2 && indOffset + 2 <= buf.length) {
-        isNull = buf.readInt16BE(indOffset) === -1;
+      if (canIndicator) {
+        const indOffset = indRowBase + c * indicatorSize;
+        if (indOffset + 2 <= buf.length) {
+          isNull = buf.readInt16BE(indOffset) === -1;
+        }
       }
 
       if (isNull) {
         row[name] = null;
-      } else {
+      } else if (handler) {
         const valOffset = rowDataOffset + colOffsets[c];
-        const { value } = decodeValue(buf, valOffset, desc, serverCCSID);
-        row[name] = value;
+        row[name] = handler.decode(buf, valOffset, descriptors[c], serverCCSID).value;
+      } else {
+        row[name] = null;
       }
     }
 

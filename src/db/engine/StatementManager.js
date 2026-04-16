@@ -223,14 +223,17 @@ export class StatementManager {
     const isSelect = stmt.columnDescriptors.length > 0;
 
     if (isSelect) {
-      // SELECT: open cursor via OPEN_AND_DESCRIBE
-      // Per JTOpen: don't send OPEN_ATTRIBUTES or BLOCKING_FACTOR in the open request.
-      // The RPB already has statement/cursor name from prepareStatement().
+      // SELECT: open cursor via OPEN_AND_DESCRIBE.
+      // Pass BLOCKING_FACTOR so the server returns the first block of rows
+      // inline with the open reply — saves 1 RTT per N rows. JTOpen does the
+      // same by default (block size ~32KB worth of rows).
+      const blockingFactor = opts.blockingFactor ?? 2048;
       const reqBuf = DBRequestDS.buildOpenAndDescribe({
         rpbId: stmt.rpbId,
         parameterMarkerData,
         pmDescriptorHandle: stmt.descriptorHandle ?? 0,
         openAttributes: 0x80,
+        blockingFactor,
       });
 
       const replyBuf = await this.#connection.sendAndReceive(reqBuf);
@@ -259,6 +262,7 @@ export class StatementManager {
         rpbId: stmt.rpbId,
         endOfData: reply.endOfData,
         columnDescriptors: stmt.columnDescriptors,
+        blockingFactor,
       };
     }
 

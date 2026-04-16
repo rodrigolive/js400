@@ -53,17 +53,40 @@ export class ConvTable {
 
   byteArrayToString(buf, offset = 0, length) {
     const len = length ?? buf.length - offset;
-    let result = '';
-    for (let i = 0; i < len; i++) {
-      result += String.fromCharCode(this.#toUnicode[buf[offset + i]]);
+    if (len <= 0) return '';
+    const table = this.#toUnicode;
+
+    // Small strings: build via String.fromCharCode.apply on a small array.
+    // This is 3-5x faster than `result += String.fromCharCode(...)` per byte,
+    // which triggers string rope allocations across each iteration.
+    if (len <= 4096) {
+      const chars = new Array(len);
+      for (let i = 0; i < len; i++) {
+        chars[i] = table[buf[offset + i]];
+      }
+      return String.fromCharCode.apply(null, chars);
     }
-    return result;
+
+    // Longer strings: chunk to stay under argument-count limits.
+    let out = '';
+    const CHUNK = 4096;
+    for (let start = 0; start < len; start += CHUNK) {
+      const end = start + CHUNK < len ? start + CHUNK : len;
+      const chars = new Array(end - start);
+      for (let i = start; i < end; i++) {
+        chars[i - start] = table[buf[offset + i]];
+      }
+      out += String.fromCharCode.apply(null, chars);
+    }
+    return out;
   }
 
   stringToByteArray(str) {
-    const buf = Buffer.alloc(str.length);
-    for (let i = 0; i < str.length; i++) {
-      buf[i] = this.#fromUnicode[str.charCodeAt(i)] || 0x3F;
+    const len = str.length;
+    const buf = Buffer.allocUnsafe(len);
+    const table = this.#fromUnicode;
+    for (let i = 0; i < len; i++) {
+      buf[i] = table[str.charCodeAt(i)] || 0x3F;
     }
     return buf;
   }
@@ -172,15 +195,32 @@ export class ConvTableUtf16 extends ConvTable {
 
   byteArrayToString(buf, offset = 0, length) {
     const len = length ?? buf.length - offset;
-    let result = '';
-    for (let i = offset; i < offset + len - 1; i += 2) {
-      result += String.fromCharCode((buf[i] << 8) | buf[i + 1]);
+    const charCount = len >> 1;
+    if (charCount <= 0) return '';
+    if (charCount <= 4096) {
+      const chars = new Array(charCount);
+      for (let i = 0; i < charCount; i++) {
+        const o = offset + (i << 1);
+        chars[i] = (buf[o] << 8) | buf[o + 1];
+      }
+      return String.fromCharCode.apply(null, chars);
     }
-    return result;
+    let out = '';
+    const CHUNK = 4096;
+    for (let start = 0; start < charCount; start += CHUNK) {
+      const end = start + CHUNK < charCount ? start + CHUNK : charCount;
+      const chars = new Array(end - start);
+      for (let i = start; i < end; i++) {
+        const o = offset + (i << 1);
+        chars[i - start] = (buf[o] << 8) | buf[o + 1];
+      }
+      out += String.fromCharCode.apply(null, chars);
+    }
+    return out;
   }
 
   stringToByteArray(str) {
-    const buf = Buffer.alloc(str.length * 2);
+    const buf = Buffer.allocUnsafe(str.length * 2);
     for (let i = 0; i < str.length; i++) {
       const code = str.charCodeAt(i);
       buf[i * 2] = (code >> 8) & 0xFF;

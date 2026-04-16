@@ -69,6 +69,7 @@ export class PreparedStatement {
         cursorManager: this.#dbConnection.cursorManager,
         rpbId: result.rpbId,
         endOfData: result.endOfData,
+        fetchSize: result.blockingFactor ?? 2048,
       });
       return rs.toArray();
     }
@@ -95,6 +96,7 @@ export class PreparedStatement {
       cursorManager: this.#dbConnection.cursorManager,
       rpbId: result.rpbId,
       endOfData: result.endOfData,
+      fetchSize: result.blockingFactor ?? 2048,
     });
   }
 

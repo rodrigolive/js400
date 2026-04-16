@@ -21,6 +21,21 @@ function encodeBinary(value, desc) {
   return b;
 }
 
+function encodeBinaryInto(value, buf, offset, fieldLen, desc) {
+  const maxLen = desc.length;
+  let written = 0;
+  if (Buffer.isBuffer(value)) {
+    written = Math.min(value.length, maxLen);
+    value.copy(buf, offset, 0, written);
+  } else if (typeof value === 'string') {
+    const hex = Buffer.from(value, 'hex');
+    written = Math.min(hex.length, maxLen);
+    hex.copy(buf, offset, 0, written);
+  }
+  if (written < maxLen) buf.fill(0, offset + written, offset + maxLen);
+  return maxLen;
+}
+
 function decodeVarbinary(buf, offset, desc) {
   const dataLen = buf.readUInt16BE(offset);
   const data = Buffer.alloc(dataLen);
@@ -45,7 +60,27 @@ function encodeVarbinary(value, desc) {
   return b;
 }
 
+function encodeVarbinaryInto(value, buf, offset, fieldLen, desc) {
+  const maxLen = desc.length;
+  let data;
+  if (Buffer.isBuffer(value)) {
+    data = value;
+  } else if (typeof value === 'string') {
+    data = Buffer.from(value, 'hex');
+  } else {
+    data = null;
+  }
+  const actualLen = data ? Math.min(data.length, maxLen) : 0;
+  buf[offset] = (actualLen >> 8) & 0xFF;
+  buf[offset + 1] = actualLen & 0xFF;
+  if (actualLen > 0) data.copy(buf, offset + 2, 0, actualLen);
+  const padStart = offset + 2 + actualLen;
+  const padEnd = offset + fieldLen;
+  if (padEnd > padStart) buf.fill(0, padStart, padEnd);
+  return fieldLen;
+}
+
 export const binaryTypes = {
-  912: { name: 'BINARY', decode: decodeBinary, encode: encodeBinary },
-  908: { name: 'VARBINARY', decode: decodeVarbinary, encode: encodeVarbinary },
+  912: { name: 'BINARY', decode: decodeBinary, encode: encodeBinary, encodeInto: encodeBinaryInto },
+  908: { name: 'VARBINARY', decode: decodeVarbinary, encode: encodeVarbinary, encodeInto: encodeVarbinaryInto },
 };

@@ -9,9 +9,18 @@
  */
 
 import { DataStream } from '../../transport/DataStream.js';
+import {
+  compressRLE,
+  RLE_THRESHOLD,
+  MIN_SAVINGS_BYTES,
+  MIN_SAVINGS_PERCENT,
+} from '../compression/rle.js';
 
 /** Server ID for the database host server. */
 const SERVER_ID = 0xE004;
+
+/** RLE compression scheme code point (value for CP 0x3832). */
+const DATA_COMPRESSION_RLE = 0x3832;
 
 /** Standard database request template length (most operations). */
 const TEMPLATE_LENGTH = 20;
@@ -519,6 +528,177 @@ export class DBRequestDS {
     });
 
     return assemblePacket(RequestID.PREPARE_AND_DESCRIBE, TEMPLATE_LENGTH, template, cps);
+  }
+
+  /**
+   * Build an EXECUTE request with the parameter marker data region
+   * reserved (but uninitialized) in the final packet buffer. Returns
+   * both the packet buffer and the byte offset where the caller must
+   * write `parameterMarkerDataSize` bytes of DBOriginalData content.
+   *
+   * This avoids two memcopies (buildRawCP's alloc+copy of the parameter
+   * buffer, then assemblePacket's alloc+copy into the final packet)
+   * that dominate CPU time for large batched INSERTs. For a 4K-row
+   * batch the parameterMarkerData is ~2-3MB; both copies are pure CPU
+   * waste.
+   *
+   * Packet layout:
+   *   +0  : header (20 bytes)        totalLen, headerId=0, serverId=0xE004,
+   *                                  CS=0, correlation, templateLen=20,
+   *                                  reqId=0x1805 (EXECUTE)
+   *   +20 : template (20 bytes)      ORS bitmap | SQLCA, handles,
+   *                                  paramCount=2, pmDescriptorHandle
+   *   +40 : BLOCK_IND CP (8 bytes)   LL=8, CP=0x3814, statementType(int16)
+   *   +48 : PM_DATA CP header (6)    LL=6+paramDataSize, CP=0x3811
+   *   +54 : <caller writes DBOriginalData content here, paramDataSize bytes>
+   *
+   * @param {object} opts
+   * @param {number} opts.rpbId
+   * @param {number} [opts.pmDescriptorHandle=0]
+   * @param {number} [opts.statementType=0]
+   * @param {number} opts.parameterMarkerDataSize - bytes caller will write
+   * @param {boolean} [opts.rleRequestCompression=false] - mark packet as RLE-compressible
+   * @param {boolean} [opts.rleReplyCompression=false] - ask the server to RLE-compress its reply
+   * @returns {{ buffer: Buffer, paramDataOffset: number }}
+   */
+  static buildExecuteInPlace(opts) {
+    const paramDataSize = opts.parameterMarkerDataSize | 0;
+    if (paramDataSize <= 0) {
+      throw new Error('parameterMarkerDataSize must be > 0');
+    }
+
+    const headerLen = DataStream.HEADER_LENGTH;  // 20
+    const templateLen = TEMPLATE_LENGTH;          // 20
+    const blockIndCpLen = 8;
+    const pmCpHeaderLen = 6;
+    const pmCpLen = pmCpHeaderLen + paramDataSize;
+    const totalLen = headerLen + templateLen + blockIndCpLen + pmCpLen;
+
+    // allocUnsafe is safe: every byte through paramDataOffset is written
+    // below; the caller is contractually required to fill
+    // paramDataSize bytes starting at paramDataOffset.
+    const buf = Buffer.allocUnsafe(totalLen);
+
+    // ---- Packet header (20 bytes) ----
+    buf.writeInt32BE(totalLen, 0);
+    buf.writeInt16BE(0, 4);                        // header ID
+    buf.writeUInt16BE(SERVER_ID, 6);               // server ID
+    buf.writeInt32BE(0, 8);                        // CS instance
+    buf.writeInt32BE(DataStream.nextCorrelation(), 12);
+    buf.writeInt16BE(templateLen, 16);             // template length
+    buf.writeUInt16BE(RequestID.EXECUTE, 18);      // request ID
+
+    // ---- Template (20 bytes) ----
+    const tOff = headerLen;
+    let orsBitmap = (ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA) >>> 0;
+    if (opts.rleRequestCompression) orsBitmap = (orsBitmap | ORSBitmap.REQUEST_RLE_COMPRESSED) >>> 0;
+    if (opts.rleReplyCompression) orsBitmap = (orsBitmap | ORSBitmap.REPLY_RLE_COMPRESSED) >>> 0;
+    const rpbId = opts.rpbId ?? 0;
+    buf.writeUInt32BE(orsBitmap, tOff);            // ORS bitmap
+    buf.writeInt32BE(0, tOff + 4);                 // reserved
+    buf.writeInt16BE(rpbId, tOff + 8);             // Return ORS handle
+    buf.writeInt16BE(rpbId, tOff + 10);            // Fill ORS handle
+    buf.writeInt16BE(0, tOff + 12);                // Based-on ORS handle
+    buf.writeInt16BE(rpbId, tOff + 14);            // RPB handle
+    buf.writeInt16BE(opts.pmDescriptorHandle ?? 0, tOff + 16); // PM desc handle
+    buf.writeInt16BE(2, tOff + 18);                // paramCount = 2 CPs
+
+    // ---- BLOCK_IND CP (8 bytes) ----
+    let cpOff = headerLen + templateLen;
+    buf.writeInt32BE(blockIndCpLen, cpOff);
+    buf.writeUInt16BE(CodePoint.PARAMETER_MARKER_BLOCK_IND, cpOff + 4);
+    buf.writeInt16BE(opts.statementType ?? 0, cpOff + 6);
+    cpOff += blockIndCpLen;
+
+    // ---- PARAMETER_MARKER_DATA CP header (6 bytes) ----
+    buf.writeInt32BE(pmCpLen, cpOff);
+    buf.writeUInt16BE(CodePoint.PARAMETER_MARKER_DATA, cpOff + 4);
+    const paramDataOffset = cpOff + pmCpHeaderLen;
+
+    return { buffer: buf, paramDataOffset };
+  }
+
+  /**
+   * Try to RLE-compress an already-built request packet in place of
+   * its original uncompressed form.
+   *
+   * Reads the current packet's header (20 bytes) + template (20 bytes),
+   * compresses the tail (bytes 40..end), and if the compression saves
+   * at least {@link MIN_SAVINGS_PERCENT}% AND {@link MIN_SAVINGS_BYTES}
+   * bytes, returns a freshly-allocated buffer in the RLE-wrapped wire
+   * format:
+   *
+   *   bytes 0-3   LL   = compressed total length
+   *   bytes 4-19  header (copied from original bytes 4..19)
+   *   bytes 20-39 template (copied from original bytes 20..39, with
+   *                REQUEST_RLE_COMPRESSED bit still set)
+   *   bytes 40-43 ll   = compressed data length + 10
+   *   bytes 44-45 CP   = 0x3832 (DATA_COMPRESSION_RLE)
+   *   bytes 46-49      = decompressed length of bytes 40..origEnd
+   *   bytes 50+        = compressed data
+   *
+   * If the packet is below the {@link RLE_THRESHOLD} or compression
+   * does not pay off, the ORS bitmap's REQUEST_RLE_COMPRESSED bit is
+   * CLEARED in the original buffer (per JTOpen's behaviour), and that
+   * buffer is returned as-is.
+   *
+   * The REPLY_RLE_COMPRESSED bit is never cleared — the server may
+   * still compress its reply regardless.
+   *
+   * @param {Buffer} reqBuf - a complete, uncompressed request packet
+   *   whose template has REQUEST_RLE_COMPRESSED already set
+   * @returns {Buffer} either the original buffer (uncompressed) or a
+   *   new RLE-wrapped buffer
+   */
+  static compressRequestInPlace(reqBuf) {
+    const total = reqBuf.length;
+    const headerLen = DataStream.HEADER_LENGTH;
+    const templateLen = TEMPLATE_LENGTH;
+    const headerTemplateLen = headerLen + templateLen;  // 40
+
+    // Too small to bother.
+    if (total <= RLE_THRESHOLD) {
+      // Clear the REQUEST_RLE bit — nothing is actually compressed.
+      const bits = reqBuf.readUInt32BE(headerLen);
+      reqBuf.writeUInt32BE((bits & ~ORSBitmap.REQUEST_RLE_COMPRESSED) >>> 0, headerLen);
+      return reqBuf;
+    }
+
+    const dataLen = total - headerTemplateLen;
+
+    // Allocate scratch for the worst-case compressed packet: wrapper
+    // (50 bytes) + dataLen. If compression doesn't help we just
+    // return the original.
+    const scratch = Buffer.allocUnsafe(50 + dataLen);
+    const compressedSize = compressRLE(reqBuf, headerTemplateLen, dataLen, scratch, 50);
+
+    let useCompression = compressedSize > 0;
+    if (useCompression) {
+      const savingsLength = dataLen - compressedSize;
+      const savingsPercent = (100 * savingsLength) / dataLen;
+      if (savingsPercent < MIN_SAVINGS_PERCENT || savingsLength < MIN_SAVINGS_BYTES) {
+        useCompression = false;
+      }
+    }
+
+    if (!useCompression) {
+      // Compression not worth it. Clear the REQUEST_RLE bit in ORS
+      // bitmap so the server knows the request body is plain.
+      const bits = reqBuf.readUInt32BE(headerLen);
+      reqBuf.writeUInt32BE((bits & ~ORSBitmap.REQUEST_RLE_COMPRESSED) >>> 0, headerLen);
+      return reqBuf;
+    }
+
+    // Build the final compressed packet header + compression wrapper.
+    const totalCompressed = compressedSize + 50;
+    scratch.writeInt32BE(totalCompressed, 0);                  // LL
+    reqBuf.copy(scratch, 4, 4, headerTemplateLen);             // bytes 4..39 = header+template
+    scratch.writeInt32BE(compressedSize + 10, 40);             // ll = cdata + 10
+    scratch.writeUInt16BE(DATA_COMPRESSION_RLE, 44);           // CP = 0x3832
+    scratch.writeInt32BE(dataLen, 46);                         // decompressed length
+
+    // Return a right-sized slice.
+    return scratch.subarray(0, totalCompressed);
   }
 
   /**

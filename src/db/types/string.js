@@ -67,6 +67,142 @@ function encodeString(str, length, ccsid) {
   }
 }
 
+/**
+ * Zero-copy CHAR encoder.
+ * Writes str directly into `buf` at `offset`, padded to `fieldLen`
+ * bytes. Pad byte is 0x40 for EBCDIC, 0x20 for UTF-8/UTF-16.
+ */
+function encodeCharInto(value, buf, offset, fieldLen, desc, serverCCSID) {
+  const ccsid = desc.ccsid || serverCCSID;
+  const str = String(value ?? '');
+  const maxLen = desc.length;
+
+  if (ccsid === 1208) {
+    const written = buf.write(str, offset, maxLen, 'utf8');
+    if (written < maxLen) buf.fill(0x20, offset + written, offset + maxLen);
+    return maxLen;
+  }
+  if (ccsid === 1200 || ccsid === 13488 || ccsid === 61952) {
+    const maxChars = maxLen >> 1;
+    const n = str.length < maxChars ? str.length : maxChars;
+    for (let i = 0; i < n; i++) {
+      const code = str.charCodeAt(i);
+      buf[offset + i * 2] = (code >> 8) & 0xFF;
+      buf[offset + i * 2 + 1] = code & 0xFF;
+    }
+    // Pad remainder with 0x0020 (UTF-16 space)
+    const padStart = offset + n * 2;
+    const padEnd = offset + maxLen;
+    for (let i = padStart; i + 1 < padEnd; i += 2) {
+      buf[i] = 0x00;
+      buf[i + 1] = 0x20;
+    }
+    return maxLen;
+  }
+  // Single-byte EBCDIC (or other single-byte CCSID)
+  try {
+    const written = CharConverter.stringToByteArrayInto(str, buf, offset, maxLen, ccsid || 37);
+    if (written < maxLen) buf.fill(0x40, offset + written, offset + maxLen);
+    return maxLen;
+  } catch {
+    // Fallback: latin1 byte copy, EBCDIC space padding
+    const n = str.length < maxLen ? str.length : maxLen;
+    for (let i = 0; i < n; i++) buf[offset + i] = str.charCodeAt(i) & 0xFF;
+    if (n < maxLen) buf.fill(0x40, offset + n, offset + maxLen);
+    return maxLen;
+  }
+}
+
+/**
+ * Zero-copy VARCHAR encoder.
+ * Writes 2-byte length prefix + data into `buf` at `offset`. Pads the
+ * slot tail with zeros up to `fieldLen`. Per JTOpen SQLVarcharBase the
+ * wire format is: [ui16 actualLen][data...][zero-pad to descriptor max].
+ */
+function encodeVarcharInto(value, buf, offset, fieldLen, desc, serverCCSID) {
+  const ccsid = desc.ccsid || serverCCSID;
+  const str = String(value ?? '');
+  const maxLen = desc.length;
+  let actualLen;
+
+  if (ccsid === 1208) {
+    actualLen = buf.write(str, offset + 2, maxLen, 'utf8');
+  } else if (ccsid === 1200 || ccsid === 13488 || ccsid === 61952) {
+    const maxChars = maxLen >> 1;
+    const n = str.length < maxChars ? str.length : maxChars;
+    for (let i = 0; i < n; i++) {
+      const code = str.charCodeAt(i);
+      buf[offset + 2 + i * 2] = (code >> 8) & 0xFF;
+      buf[offset + 2 + i * 2 + 1] = code & 0xFF;
+    }
+    actualLen = n * 2;
+  } else {
+    try {
+      actualLen = CharConverter.stringToByteArrayInto(str, buf, offset + 2, maxLen, ccsid || 37);
+    } catch {
+      const n = str.length < maxLen ? str.length : maxLen;
+      for (let i = 0; i < n; i++) buf[offset + 2 + i] = str.charCodeAt(i) & 0xFF;
+      actualLen = n;
+    }
+  }
+
+  buf[offset] = (actualLen >> 8) & 0xFF;
+  buf[offset + 1] = actualLen & 0xFF;
+
+  // Zero-pad tail to descriptor max. JTOpen SQLVarcharBase always
+  // pads — even a few bytes — to avoid leaking uninitialized bytes
+  // from the request buffer. We allocUnsafe the request body, so we
+  // MUST clear the tail here.
+  const padStart = offset + 2 + actualLen;
+  const padEnd = offset + fieldLen;
+  if (padEnd > padStart) {
+    buf.fill(0, padStart, padEnd);
+  }
+  return fieldLen;
+}
+
+function encodeVargraphicInto(value, buf, offset, fieldLen, desc, serverCCSID) {
+  const ccsid = desc.ccsid || 13488;
+  const str = String(value ?? '');
+  const maxLen = desc.length;
+  const maxChars = maxLen >> 1;
+  const n = str.length < maxChars ? str.length : maxChars;
+  for (let i = 0; i < n; i++) {
+    const code = str.charCodeAt(i);
+    buf[offset + 2 + i * 2] = (code >> 8) & 0xFF;
+    buf[offset + 2 + i * 2 + 1] = code & 0xFF;
+  }
+  const actualLen = n * 2;
+  buf[offset] = (actualLen >> 8) & 0xFF;
+  buf[offset + 1] = actualLen & 0xFF;
+  const padStart = offset + 2 + actualLen;
+  const padEnd = offset + fieldLen;
+  if (padEnd > padStart) {
+    buf.fill(0, padStart, padEnd);
+  }
+  return fieldLen;
+}
+
+function encodeGraphicInto(value, buf, offset, fieldLen, desc, serverCCSID) {
+  const ccsid = desc.ccsid || 13488;
+  const str = String(value ?? '');
+  const maxLen = desc.length;
+  const maxChars = maxLen >> 1;
+  const n = str.length < maxChars ? str.length : maxChars;
+  for (let i = 0; i < n; i++) {
+    const code = str.charCodeAt(i);
+    buf[offset + i * 2] = (code >> 8) & 0xFF;
+    buf[offset + i * 2 + 1] = code & 0xFF;
+  }
+  const padStart = offset + n * 2;
+  const padEnd = offset + maxLen;
+  for (let i = padStart; i + 1 < padEnd; i += 2) {
+    buf[i] = 0x00;
+    buf[i + 1] = 0x20;
+  }
+  return maxLen;
+}
+
 // CHAR — fixed-length character
 function decodeChar(buf, offset, desc, serverCCSID) {
   const ccsid = desc.ccsid || serverCCSID;
@@ -153,10 +289,10 @@ function decodeLongGraphic(buf, offset, desc, serverCCSID) {
 }
 
 export const stringTypes = {
-  452: { name: 'CHAR', decode: decodeChar, encode: encodeChar },
-  448: { name: 'VARCHAR', decode: decodeVarchar, encode: encodeVarchar },
-  456: { name: 'LONGVARCHAR', decode: decodeLongVarchar, encode: encodeVarchar },
-  468: { name: 'GRAPHIC', decode: decodeGraphic, encode: encodeGraphic },
-  464: { name: 'VARGRAPHIC', decode: decodeVargraphic, encode: encodeVargraphic },
-  472: { name: 'LONGGRAPHIC', decode: decodeLongGraphic, encode: encodeVargraphic },
+  452: { name: 'CHAR', decode: decodeChar, encode: encodeChar, encodeInto: encodeCharInto },
+  448: { name: 'VARCHAR', decode: decodeVarchar, encode: encodeVarchar, encodeInto: encodeVarcharInto },
+  456: { name: 'LONGVARCHAR', decode: decodeLongVarchar, encode: encodeVarchar, encodeInto: encodeVarcharInto },
+  468: { name: 'GRAPHIC', decode: decodeGraphic, encode: encodeGraphic, encodeInto: encodeGraphicInto },
+  464: { name: 'VARGRAPHIC', decode: decodeVargraphic, encode: encodeVargraphic, encodeInto: encodeVargraphicInto },
+  472: { name: 'LONGGRAPHIC', decode: decodeLongGraphic, encode: encodeVargraphic, encodeInto: encodeVargraphicInto },
 };

@@ -74,6 +74,39 @@ export function encodeValue(value, descriptor, serverCCSID = 37) {
 }
 
 /**
+ * Encode a JS value directly into a destination buffer at `offset`.
+ *
+ * This is the zero-copy hot path used by executeBatch: the caller
+ * pre-allocates the entire DBOriginalData body, then each field is
+ * written in place. Types that don't implement encodeInto fall back
+ * to `encodeValue + copy`.
+ *
+ * @param {any} value
+ * @param {Buffer} buf - destination buffer
+ * @param {number} offset - byte offset in `buf` where the field starts
+ * @param {number} fieldLen - total bytes reserved for the field (including
+ *                            VARCHAR length prefix, and any fixed-width pad)
+ * @param {object} descriptor - parameter descriptor
+ * @param {number} [serverCCSID=37]
+ * @returns {number} bytes written (always fieldLen for fixed-width and
+ *                   VARCHAR-family slots)
+ */
+export function encodeValueInto(value, buf, offset, fieldLen, descriptor, serverCCSID = 37) {
+  const handler = getTypeHandler(descriptor.sqlType);
+  if (!handler) {
+    throw new Error(`No encoder for SQL type ${descriptor.sqlType}`);
+  }
+  if (handler.encodeInto) {
+    return handler.encodeInto(value, buf, offset, fieldLen, descriptor, serverCCSID);
+  }
+  const encoded = handler.encode(value, descriptor, serverCCSID);
+  const n = Math.min(encoded.length, fieldLen);
+  encoded.copy(buf, offset, 0, n);
+  if (n < fieldLen) buf.fill(0, offset + n, offset + fieldLen);
+  return fieldLen;
+}
+
+/**
  * Decode an entire row from a buffer given column descriptors.
  *
  * @param {Buffer} buf - row data

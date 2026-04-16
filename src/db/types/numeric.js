@@ -17,6 +17,11 @@ function encodeSmallint(value, desc) {
   return b;
 }
 
+function encodeSmallintInto(value, buf, offset, fieldLen) {
+  buf.writeInt16BE(Number(value) | 0, offset);
+  return 2;
+}
+
 function decodeInteger(buf, offset, desc) {
   return { value: buf.readInt32BE(offset), bytesRead: 4 };
 }
@@ -27,6 +32,11 @@ function encodeInteger(value, desc) {
   return b;
 }
 
+function encodeIntegerInto(value, buf, offset, fieldLen) {
+  buf.writeInt32BE(Number(value) | 0, offset);
+  return 4;
+}
+
 function decodeBigint(buf, offset, desc) {
   return { value: buf.readBigInt64BE(offset), bytesRead: 8 };
 }
@@ -35,6 +45,11 @@ function encodeBigint(value, desc) {
   const b = Buffer.alloc(8);
   b.writeBigInt64BE(BigInt(value), 0);
   return b;
+}
+
+function encodeBigintInto(value, buf, offset, fieldLen) {
+  buf.writeBigInt64BE(BigInt(value), offset);
+  return 8;
 }
 
 function decodeFloat(buf, offset, desc) {
@@ -53,6 +68,15 @@ function encodeFloat(value, desc) {
   const b = Buffer.alloc(8);
   b.writeDoubleBE(Number(value), 0);
   return b;
+}
+
+function encodeFloatInto(value, buf, offset, fieldLen, desc) {
+  if (desc.length === 4) {
+    buf.writeFloatBE(Number(value), offset);
+    return 4;
+  }
+  buf.writeDoubleBE(Number(value), offset);
+  return 8;
 }
 
 /**
@@ -118,6 +142,31 @@ function encodeDecimal(value, desc) {
   return b;
 }
 
+function encodeDecimalInto(value, buf, offset, fieldLen, desc) {
+  const byteLen = desc.length;
+  const scale = desc.scale;
+  const num = Number(value);
+  const negative = num < 0;
+  const abs = Math.abs(num);
+
+  const scaled = Math.round(abs * Math.pow(10, scale));
+  let digits = scaled.toString();
+  const totalDigits = (byteLen * 2) - 1;
+  while (digits.length < totalDigits) digits = '0' + digits;
+  if (digits.length > totalDigits) digits = digits.slice(digits.length - totalDigits);
+
+  let dIdx = 0;
+  for (let i = 0; i < byteLen - 1; i++) {
+    const hi = digits.charCodeAt(dIdx++) - 0x30;
+    const lo = digits.charCodeAt(dIdx++) - 0x30;
+    buf[offset + i] = (hi << 4) | lo;
+  }
+  const lastHi = digits.charCodeAt(dIdx) - 0x30;
+  const sign = negative ? 0x0D : 0x0F;
+  buf[offset + byteLen - 1] = (lastHi << 4) | sign;
+  return byteLen;
+}
+
 /**
  * Decode zoned decimal (one digit per byte in EBCDIC zone format).
  * Zone nibble is 0xF for digits, last byte sign in low nibble.
@@ -175,6 +224,30 @@ function encodeNumeric(value, desc) {
   return b;
 }
 
+function encodeNumericInto(value, buf, offset, fieldLen, desc) {
+  const byteLen = desc.length;
+  const scale = desc.scale;
+  const num = Number(value);
+  const negative = num < 0;
+  const abs = Math.abs(num);
+
+  const scaled = Math.round(abs * Math.pow(10, scale));
+  let digits = scaled.toString();
+  while (digits.length < byteLen) digits = '0' + digits;
+  if (digits.length > byteLen) digits = digits.slice(digits.length - byteLen);
+
+  for (let i = 0; i < byteLen; i++) {
+    const d = digits.charCodeAt(i) - 0x30;
+    if (i === byteLen - 1) {
+      const sign = negative ? 0x0D : 0x0F;
+      buf[offset + i] = (sign << 4) | d;
+    } else {
+      buf[offset + i] = 0xF0 | d;
+    }
+  }
+  return byteLen;
+}
+
 /**
  * Decode DECFLOAT (16 or 34 digits).
  * For now, parse as a double since JS doesn't have native decimal types.
@@ -201,16 +274,24 @@ function encodeDecFloat(value, desc) {
   return b;
 }
 
+function encodeDecFloatInto(value, buf, offset, fieldLen, desc) {
+  buf.writeDoubleBE(Number(value), offset);
+  if (desc.length > 8) {
+    buf.fill(0, offset + 8, offset + desc.length);
+  }
+  return desc.length;
+}
+
 /**
  * Type handler registry keyed by the masked SQL type code.
  * Key = Math.abs(sqlType) & 0xFFFE
  */
 export const numericTypes = {
-  500: { name: 'SMALLINT', decode: decodeSmallint, encode: encodeSmallint },
-  496: { name: 'INTEGER', decode: decodeInteger, encode: encodeInteger },
-  492: { name: 'BIGINT', decode: decodeBigint, encode: encodeBigint },
-  480: { name: 'FLOAT', decode: decodeFloat, encode: encodeFloat },
-  484: { name: 'DECIMAL', decode: decodeDecimal, encode: encodeDecimal },
-  488: { name: 'NUMERIC', decode: decodeNumeric, encode: encodeNumeric },
-  996: { name: 'DECFLOAT', decode: decodeDecFloat, encode: encodeDecFloat },
+  500: { name: 'SMALLINT', decode: decodeSmallint, encode: encodeSmallint, encodeInto: encodeSmallintInto },
+  496: { name: 'INTEGER', decode: decodeInteger, encode: encodeInteger, encodeInto: encodeIntegerInto },
+  492: { name: 'BIGINT', decode: decodeBigint, encode: encodeBigint, encodeInto: encodeBigintInto },
+  480: { name: 'FLOAT', decode: decodeFloat, encode: encodeFloat, encodeInto: encodeFloatInto },
+  484: { name: 'DECIMAL', decode: decodeDecimal, encode: encodeDecimal, encodeInto: encodeDecimalInto },
+  488: { name: 'NUMERIC', decode: decodeNumeric, encode: encodeNumeric, encodeInto: encodeNumericInto },
+  996: { name: 'DECFLOAT', decode: decodeDecFloat, encode: encodeDecFloat, encodeInto: encodeDecFloatInto },
 };

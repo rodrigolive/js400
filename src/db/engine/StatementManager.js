@@ -18,7 +18,8 @@ import {
   parseBasicDataFormat, parseSuperExtendedDataFormat,
   getColumnByteLength,
 } from '../protocol/DBDescriptors.js';
-import { encodeValue, decodeResultData } from '../types/factory.js';
+import { encodeValue, encodeValueInto, decodeResultData, getTypeHandler } from '../types/factory.js';
+import { CharConverter } from '../../ccsid/CharConverter.js';
 
 let rpbCounter = 0;
 
@@ -328,56 +329,64 @@ export class StatementManager {
       };
     }
 
-    // Pre-encode every value once. We need the encoded buffers both to
-    // size resizable (VARCHAR-family) columns and to pack the data block.
-    // Memory: roughly paramSets.length × paramCount × avg 40 bytes.
     const paramCount = stmt.paramDescriptors.length;
-    const encodedRows = new Array(batchSize);
-    const nullRows = new Array(batchSize);
+    const ccsid = this.#serverCCSID;
 
-    // Track the widest encoded length per column for resizable types.
-    // For fixed-width types this is unused.
-    const maxFieldLen = new Array(paramCount).fill(0);
+    // Classify each column once: resizable? CCSID? This drives the width
+    // computation without re-parsing the sqlType per row.
     const isResizable = new Array(paramCount);
+    const colCcsid = new Array(paramCount);
     for (let c = 0; c < paramCount; c++) {
-      isResizable[c] = isResizableParameterType(stmt.paramDescriptors[c].sqlType);
+      const d = stmt.paramDescriptors[c];
+      isResizable[c] = isResizableParameterType(d.sqlType);
+      colCcsid[c] = d.ccsid || ccsid;
     }
 
-    for (let r = 0; r < batchSize; r++) {
-      const params = paramSets[r];
-      const encoded = new Array(paramCount);
-      const nulls = new Uint8Array(paramCount);
-      for (let c = 0; c < paramCount; c++) {
-        const v = params?.[c];
-        if (v === null || v === undefined) {
-          nulls[c] = 1;
-          encoded[c] = null;
-          continue;
-        }
-        const desc = stmt.paramDescriptors[c];
-        const buf = encodeValue(v, desc, this.#serverCCSID);
-        encoded[c] = buf;
-        if (isResizable[c] && buf.length > maxFieldLen[c]) {
-          maxFieldLen[c] = buf.length;
+    // Pass 1: determine per-column width for resizable types. We do
+    // this WITHOUT fully encoding — for single-byte CCSIDs (the a live IBM i host
+    // default CCSID 37 case), byte length equals char length, so a
+    // plain `String(v).length` scan suffices. For UTF-8 we delegate to
+    // Buffer.byteLength, and for UTF-16 it's 2 × char count.
+    //
+    // This avoids the per-field Buffer allocation storm in the prior
+    // implementation (4K rows × 35 cols ≈ 140K Buffer allocations per
+    // chunk) — the single biggest source of GC pressure in the hot path.
+    const maxFieldDataLen = new Array(paramCount).fill(0);
+    let hasAnyResizable = false;
+    for (let c = 0; c < paramCount; c++) {
+      if (isResizable[c]) { hasAnyResizable = true; break; }
+    }
+    if (hasAnyResizable) {
+      for (let r = 0; r < batchSize; r++) {
+        const params = paramSets[r];
+        if (!params) continue;
+        for (let c = 0; c < paramCount; c++) {
+          if (!isResizable[c]) continue;
+          const v = params[c];
+          if (v === null || v === undefined) continue;
+          const s = typeof v === 'string' ? v : String(v);
+          let bl;
+          if (colCcsid[c] === 1208) {
+            bl = Buffer.byteLength(s, 'utf8');
+          } else if (colCcsid[c] === 1200 || colCcsid[c] === 13488 || colCcsid[c] === 61952) {
+            bl = s.length * 2;
+          } else {
+            bl = s.length; // single-byte EBCDIC / binary
+          }
+          if (bl > maxFieldDataLen[c]) maxFieldDataLen[c] = bl;
         }
       }
-      encodedRows[r] = encoded;
-      nullRows[r] = nulls;
     }
 
-    // Build batch-width descriptors. For resizable columns, length is
-    // max(encoded - 2) across the batch (2-byte length prefix). For
-    // fixed columns, copy from the server descriptor.
+    // Build batch-width descriptors. Resizable columns shrink to the
+    // widest observed value (clamped to server-described max).
     const batchDescriptors = new Array(paramCount);
     let paramRecordSize = 0;
     for (let c = 0; c < paramCount; c++) {
       const src = stmt.paramDescriptors[c];
       if (isResizable[c]) {
-        // Cap at the server-described maximum; a VARCHAR(50) column
-        // cannot accept a 51-byte value, but also never needs more.
         const serverMax = src.length;
-        const wanted = Math.max(0, maxFieldLen[c] - 2);
-        const chosen = Math.min(serverMax, wanted);
+        const chosen = Math.min(serverMax, maxFieldDataLen[c]);
         batchDescriptors[c] = { ...src, length: chosen, rawFieldLength: 2 + chosen };
       } else {
         batchDescriptors[c] = src;
@@ -386,10 +395,7 @@ export class StatementManager {
     }
 
     // Send the change-descriptor only when widths actually change.
-    // On subsequent batches with the same schema we can skip this RTT;
-    // the server still remembers the widths from the previous batch.
-    // For typical bulk inserts of fixed-width rows this saves one RTT
-    // per chunk after the first.
+    // On subsequent batches with the same schema we can skip this RTT.
     if (stmt.descriptorHandle === 0) {
       stmt.descriptorHandle = stmt.rpbId;
     }
@@ -416,21 +422,51 @@ export class StatementManager {
     let totalAffected = 0;
     let lastSqlca = null;
 
+    // DBOriginalData layout constants (see #encodeParametersBatchInto).
+    const DBOD_HEADER_SIZE = 14;
+    const INDICATOR_SIZE = 2;
+
+    const prof = StatementManager._batchProfile;
     for (let chunkStart = 0; chunkStart < batchSize; chunkStart += MAX_CHUNK) {
       const chunkEnd = Math.min(chunkStart + MAX_CHUNK, batchSize);
       const chunkRowCount = chunkEnd - chunkStart;
 
-      const parameterMarkerData = this.#encodeParametersBatch(
-        encodedRows, nullRows, batchDescriptors, chunkStart, chunkRowCount, paramRecordSize,
-      );
+      // Size of the 0x3811 DBOriginalData content (header + indicators + data)
+      const indicatorBlockSize = chunkRowCount * paramCount * INDICATOR_SIZE;
+      const dataBlockSize = chunkRowCount * paramRecordSize;
+      const paramDataSize = DBOD_HEADER_SIZE + indicatorBlockSize + dataBlockSize;
 
-      const reqBuf = DBRequestDS.buildExecute({
+      const tEnc0 = prof ? performance.now() : 0;
+      // Allocate the FINAL packet up-front; reserve the DBOriginalData
+      // region and fill it directly. No intermediate parameterMarkerData
+      // buffer, no double memcopy.
+      const { buffer: reqBuf, paramDataOffset } = DBRequestDS.buildExecuteInPlace({
         rpbId: stmt.rpbId,
-        parameterMarkerData,
         pmDescriptorHandle: stmt.descriptorHandle,
+        parameterMarkerDataSize: paramDataSize,
+        rleRequestCompression: true,
+        rleReplyCompression: true,
       });
 
-      const replyBuf = await this.#connection.sendAndReceive(reqBuf);
+      this.#encodeParametersBatchInto(
+        paramSets, batchDescriptors, chunkStart, chunkRowCount, paramRecordSize,
+        reqBuf, paramDataOffset,
+      );
+
+      // Try RLE compression: for CHAR-heavy batch data (lots of 0x40
+      // EBCDIC spaces and zero padding), this typically shrinks the
+      // wire packet 3-5x, dramatically reducing send time on limited
+      // uplinks.
+      const sendBuf = DBRequestDS.compressRequestInPlace(reqBuf);
+      if (prof) prof.encodeMs += performance.now() - tEnc0;
+
+      const tNet0 = prof ? performance.now() : 0;
+      const replyBuf = await this.#connection.sendAndReceive(sendBuf);
+      if (prof) {
+        prof.netMs += performance.now() - tNet0;
+        prof.packetBytes += sendBuf.length;
+        prof.rowCount += chunkRowCount;
+      }
       const reply = parseOperationReply(replyBuf, { serverCCSID: this.#serverCCSID });
       throwIfError(reply.sqlca, 'Execute (batch)');
 
@@ -595,72 +631,246 @@ export class StatementManager {
    * @param {number} rowSize - bytes per row (excluding indicators)
    * @returns {Buffer}
    */
-  #encodeParametersBatch(encodedRows, nullRows, descriptors, rowStart, rowCount, rowSize) {
+  /**
+   * Zero-copy batch encoder. Writes the DBOriginalData code-point
+   * content (header + indicators + data) directly into the caller's
+   * `buf` starting at `baseOffset`. No intermediate buffer is
+   * allocated — this mirrors JTOpen's pattern of writing parameter
+   * bytes straight into the request datastream's backing byte array.
+   *
+   * Caller is responsible for pre-sizing `buf` to hold at least
+   * `14 + rowCount*columnCount*2 + rowCount*rowSize` bytes starting
+   * at `baseOffset`.
+   *
+   * @param {any[][]} paramSets - caller's parameter rows (not pre-encoded)
+   * @param {object[]} descriptors - batch-width descriptors
+   * @param {number} rowStart
+   * @param {number} rowCount
+   * @param {number} rowSize - bytes per row (excluding indicators)
+   * @param {Buffer} buf - destination (packet) buffer
+   * @param {number} baseOffset - byte offset in `buf` where DBOriginalData starts
+   */
+  #encodeParametersBatchInto(paramSets, descriptors, rowStart, rowCount, rowSize, buf, baseOffset) {
     const columnCount = descriptors.length;
     const indicatorSize = 2;
     const headerSize = 14;
     const indicatorBlockSize = rowCount * columnCount * indicatorSize;
-    const dataBlockSize = rowCount * rowSize;
-    const totalSize = headerSize + indicatorBlockSize + dataBlockSize;
 
-    // allocUnsafe is safe here: the header, indicator block, and data
-    // block are fully overwritten below. VARCHAR padding is written
-    // explicitly (we zero the unused tail per field below).
-    const buf = Buffer.allocUnsafe(totalSize);
+    // DBOriginalData header (14 bytes) at baseOffset
+    buf.writeInt32BE(1, baseOffset);                     // consistencyToken
+    buf.writeInt32BE(rowCount, baseOffset + 4);          // rowCount
+    buf.writeInt16BE(columnCount, baseOffset + 8);       // columnCount
+    buf.writeInt16BE(indicatorSize, baseOffset + 10);    // indicatorSize
+    buf.writeInt16BE(rowSize, baseOffset + 12);          // rowSize (data only)
 
-    // Header
-    buf.writeInt32BE(1, 0);                     // consistencyToken
-    buf.writeInt32BE(rowCount, 4);              // rowCount
-    buf.writeInt16BE(columnCount, 8);           // columnCount
-    buf.writeInt16BE(indicatorSize, 10);        // indicatorSize
-    buf.writeInt16BE(rowSize, 12);              // rowSize (data only)
-
-    // Pre-compute per-column offsets within a row.
+    // Pre-resolve per-column state once per chunk:
+    //   - field offset / length within a row
+    //   - a specialized encoder closure that captures the type handler,
+    //     CCSID converter table, and column width
+    // This eliminates the ~7M Map.get calls per 200K-row load run that
+    // the generic `encodeValueInto` -> `getTypeHandler` -> `CharConverter`
+    // path would incur, and lets V8 inline the hot cases.
     const colOffsets = new Array(columnCount);
-    const colByteLens = new Array(columnCount);
+    const colEncoders = new Array(columnCount);
     let off = 0;
     for (let c = 0; c < columnCount; c++) {
       colOffsets[c] = off;
-      const fieldLen = getColumnByteLength(descriptors[c]);
-      colByteLens[c] = fieldLen;
+      const desc = descriptors[c];
+      const fieldLen = getColumnByteLength(desc);
       off += fieldLen;
+      colEncoders[c] = this.#makeColumnEncoder(desc, fieldLen);
     }
 
-    const indicatorStart = headerSize;
-    const dataStart = headerSize + indicatorBlockSize;
+    const indicatorStart = baseOffset + headerSize;
+    const dataStart = baseOffset + headerSize + indicatorBlockSize;
 
     for (let r = 0; r < rowCount; r++) {
-      const srcRow = encodedRows[rowStart + r];
-      const nulls = nullRows[rowStart + r];
+      const params = paramSets[rowStart + r];
       const indRowBase = indicatorStart + r * columnCount * indicatorSize;
       const rowDataBase = dataStart + r * rowSize;
 
       for (let c = 0; c < columnCount; c++) {
-        const fieldLen = colByteLens[c];
         const fieldStart = rowDataBase + colOffsets[c];
+        const indOff = indRowBase + c * indicatorSize;
+        const v = params ? params[c] : undefined;
 
-        if (nulls[c]) {
-          buf.writeInt16BE(-1, indRowBase + c * indicatorSize);
-          // Zero the data slot so we don't leak allocUnsafe bytes.
-          buf.fill(0, fieldStart, fieldStart + fieldLen);
+        if (v === null || v === undefined) {
+          // NULL: indicator = -1 (0xFFFF). Encoder is still called to
+          // zero-fill the data slot and avoid leaking allocUnsafe bytes.
+          buf[indOff] = 0xFF;
+          buf[indOff + 1] = 0xFF;
+          colEncoders[c](null, buf, fieldStart);
           continue;
         }
 
-        buf.writeInt16BE(0, indRowBase + c * indicatorSize);
-        const encoded = srcRow[c];
-        if (encoded.length >= fieldLen) {
-          encoded.copy(buf, fieldStart, 0, fieldLen);
-        } else {
-          // Fixed-width field with a short encoded buffer: copy and
-          // zero-pad the tail. For VARCHAR this is the normal case
-          // (copy 2-byte length + data, pad remainder to desc.length).
-          encoded.copy(buf, fieldStart, 0, encoded.length);
-          buf.fill(0, fieldStart + encoded.length, fieldStart + fieldLen);
-        }
+        // NOT NULL: indicator = 0
+        buf[indOff] = 0x00;
+        buf[indOff + 1] = 0x00;
+        colEncoders[c](v, buf, fieldStart);
+      }
+    }
+  }
+
+  /**
+   * Build a specialized encoder closure for one column that writes a
+   * field value directly into a Buffer at a given offset. The closure
+   * captures per-column state (fieldLen, CCSID table, type handler) so
+   * the hot loop in `#encodeParametersBatchInto` does zero Map lookups
+   * per field.
+   *
+   * Specialized inline paths (no function call into a type handler):
+   *   - VARCHAR + single-byte EBCDIC (e.g. CCSID 37, 500, 280)
+   *   - CHAR    + single-byte EBCDIC
+   *   - INTEGER, SMALLINT, BIGINT
+   *   - FLOAT (REAL and DOUBLE)
+   *
+   * Other types fall back to `handler.encodeInto` captured in the
+   * closure, avoiding the Map.get on each call but still paying one
+   * function call.
+   *
+   * @returns {(value: any, buf: Buffer, offset: number) => void}
+   */
+  #makeColumnEncoder(desc, fieldLen) {
+    const ccsid = desc.ccsid || this.#serverCCSID;
+    const absType = Math.abs(desc.sqlType) & 0xFFFE;
+    const maxLen = desc.length;
+
+    const isSingleByteCcsid = ccsid !== 1208 && ccsid !== 1200
+      && ccsid !== 13488 && ccsid !== 61952 && ccsid !== 65535;
+
+    // ---- VARCHAR / LONGVARCHAR, single-byte EBCDIC ----
+    // Hot path for the typical IBM i insert: VARCHAR columns on CCSID 37.
+    // Writes [ui16 actualLen][data...][zero pad to fieldLen-2-actualLen].
+    if ((absType === 448 || absType === 456) && isSingleByteCcsid) {
+      let table;
+      try {
+        table = CharConverter.getConverter(ccsid).fromUnicodeTable;
+      } catch {
+        table = null;
+      }
+      if (table) {
+        return (v, buf, offset) => {
+          if (v === null || v === undefined) {
+            buf.fill(0, offset, offset + fieldLen);
+            return;
+          }
+          const s = typeof v === 'string' ? v : String(v);
+          const n = s.length < maxLen ? s.length : maxLen;
+          const base = offset + 2;
+          for (let i = 0; i < n; i++) {
+            buf[base + i] = table[s.charCodeAt(i)] || 0x3F;
+          }
+          buf[offset] = (n >> 8) & 0xFF;
+          buf[offset + 1] = n & 0xFF;
+          const padStart = base + n;
+          const padEnd = offset + fieldLen;
+          if (padEnd > padStart) buf.fill(0, padStart, padEnd);
+        };
       }
     }
 
-    return buf;
+    // ---- CHAR, single-byte EBCDIC ----
+    if (absType === 452 && isSingleByteCcsid) {
+      let table;
+      try {
+        table = CharConverter.getConverter(ccsid).fromUnicodeTable;
+      } catch {
+        table = null;
+      }
+      if (table) {
+        return (v, buf, offset) => {
+          if (v === null || v === undefined) {
+            buf.fill(0, offset, offset + fieldLen);
+            return;
+          }
+          const s = typeof v === 'string' ? v : String(v);
+          const n = s.length < maxLen ? s.length : maxLen;
+          for (let i = 0; i < n; i++) {
+            buf[offset + i] = table[s.charCodeAt(i)] || 0x3F;
+          }
+          if (n < maxLen) buf.fill(0x40, offset + n, offset + maxLen);
+        };
+      }
+    }
+
+    // ---- INTEGER ----
+    if (absType === 496) {
+      return (v, buf, offset) => {
+        if (v === null || v === undefined) {
+          buf.fill(0, offset, offset + 4);
+          return;
+        }
+        buf.writeInt32BE(Number(v) | 0, offset);
+      };
+    }
+
+    // ---- SMALLINT ----
+    if (absType === 500) {
+      return (v, buf, offset) => {
+        if (v === null || v === undefined) {
+          buf[offset] = 0;
+          buf[offset + 1] = 0;
+          return;
+        }
+        buf.writeInt16BE(Number(v) | 0, offset);
+      };
+    }
+
+    // ---- BIGINT ----
+    if (absType === 492) {
+      return (v, buf, offset) => {
+        if (v === null || v === undefined) {
+          buf.fill(0, offset, offset + 8);
+          return;
+        }
+        buf.writeBigInt64BE(BigInt(v), offset);
+      };
+    }
+
+    // ---- FLOAT (REAL or DOUBLE, chosen by desc.length) ----
+    if (absType === 480) {
+      if (desc.length === 4) {
+        return (v, buf, offset) => {
+          if (v === null || v === undefined) {
+            buf.fill(0, offset, offset + 4);
+            return;
+          }
+          buf.writeFloatBE(Number(v), offset);
+        };
+      }
+      return (v, buf, offset) => {
+        if (v === null || v === undefined) {
+          buf.fill(0, offset, offset + 8);
+          return;
+        }
+        buf.writeDoubleBE(Number(v), offset);
+      };
+    }
+
+    // ---- Fallback: capture handler.encodeInto in the closure ----
+    const handler = getTypeHandler(desc.sqlType);
+    if (handler && handler.encodeInto) {
+      const encodeInto = handler.encodeInto;
+      const serverCcsid = this.#serverCCSID;
+      return (v, buf, offset) => {
+        if (v === null || v === undefined) {
+          buf.fill(0, offset, offset + fieldLen);
+          return;
+        }
+        encodeInto(v, buf, offset, fieldLen, desc, serverCcsid);
+      };
+    }
+
+    // Last-resort fallback: the generic dispatcher (still only 1 Map.get
+    // per call, but no pre-resolution possible here).
+    const serverCcsid = this.#serverCCSID;
+    return (v, buf, offset) => {
+      if (v === null || v === undefined) {
+        buf.fill(0, offset, offset + fieldLen);
+        return;
+      }
+      encodeValueInto(v, buf, offset, fieldLen, desc, serverCcsid);
+    };
   }
 
   #encodeParameters(params, descriptors, encodedValues = []) {

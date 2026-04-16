@@ -88,6 +88,52 @@ export class CharConverter {
     return conv.stringToByteArray(str);
   }
 
+  /**
+   * Resolve (and cache) the underlying ConvTable for a CCSID.
+   *
+   * Exposed so hot paths (SQL batch encoding) can pre-resolve the
+   * converter per column once, avoiding a Map lookup and branch cascade
+   * on every field of every row. The returned object has a
+   * `fromUnicodeTable` getter for single-byte EBCDIC CCSIDs, which is
+   * the common case on IBM i (CCSID 37, 500, 280, etc.).
+   */
+  static getConverter(ccsid) {
+    return getOrCreateConverter(ccsid);
+  }
+
+  /**
+   * Encode up to `maxLen` bytes of `str` directly into `dest` at
+   * `destOffset` without an intermediate Buffer. Returns bytes written.
+   * For single-byte EBCDIC this is a 1-to-1 char-to-byte mapping; for
+   * UTF-8 we delegate to Buffer.write; for UTF-16 we emit 2 bytes per
+   * char. Unused bytes at the tail are NOT zeroed — the caller must
+   * pad if needed.
+   */
+  static stringToByteArrayInto(str, dest, destOffset, maxLen, ccsid) {
+    if (ccsid === 1208) {
+      return dest.write(str, destOffset, maxLen, 'utf8');
+    }
+    if (ccsid === 1200 || ccsid === 13488 || ccsid === 61952) {
+      const maxChars = maxLen >> 1;
+      const n = str.length < maxChars ? str.length : maxChars;
+      for (let i = 0; i < n; i++) {
+        const code = str.charCodeAt(i);
+        dest[destOffset + i * 2] = (code >> 8) & 0xFF;
+        dest[destOffset + i * 2 + 1] = code & 0xFF;
+      }
+      return n * 2;
+    }
+    if (ccsid === 65535) {
+      const n = str.length < maxLen ? str.length : maxLen;
+      for (let i = 0; i < n; i++) {
+        dest[destOffset + i] = str.charCodeAt(i) & 0xFF;
+      }
+      return n;
+    }
+    const conv = getOrCreateConverter(ccsid);
+    return conv.stringToByteArrayInto(str, dest, destOffset, maxLen);
+  }
+
   static isSupported(ccsid) {
     return SPECIAL_CCSIDS[ccsid] !== undefined || ccsidRegistry.has(ccsid);
   }

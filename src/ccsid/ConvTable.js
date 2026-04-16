@@ -51,6 +51,13 @@ export class ConvTable {
 
   get ccsid() { return this.#ccsid; }
 
+  /**
+   * Expose the from-unicode lookup table as a Uint8Array.
+   * Used by the SQL fast path to inline single-byte EBCDIC encoding
+   * without going through an additional method call per field.
+   */
+  get fromUnicodeTable() { return this.#fromUnicode; }
+
   byteArrayToString(buf, offset = 0, length) {
     const len = length ?? buf.length - offset;
     if (len <= 0) return '';

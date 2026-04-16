@@ -20,6 +20,12 @@
 import { DataStream } from '../../transport/DataStream.js';
 import { DatastreamError, SqlError } from '../../core/errors.js';
 import { CharConverter } from '../../ccsid/CharConverter.js';
+import { decompressRLE } from '../compression/rle.js';
+
+/** Code point for an RLE-compressed reply payload. */
+const DATA_COMPRESSION_RLE_CP = 0x3832;
+/** Bit set in template int32 at offset +4 when the reply body is RLE-compressed. */
+const REPLY_COMPRESSED_FLAG = 0x80000000 | 0;
 
 /** SQLCA size in the wire protocol (without SQLCAID/SQLCABC header). */
 const SQLCA_LENGTH = 124;
@@ -54,6 +60,21 @@ export function parseReply(buf) {
     throw new DatastreamError('Database reply too short', { bufferOffsets: { start: 0, end: buf?.length ?? 0 } });
   }
 
+  // Transparently decompress RLE-compressed reply bodies. The server
+  // signals compression by setting bit 0x80000000 in the template's
+  // int32 at offset +4 (absolute offset 24) and places the compressed
+  // payload at byte 50+ with an 0x3832 CP at bytes 44-45 and the
+  // decompressed length at bytes 46-49.
+  if (buf.length >= 50) {
+    const compressedFlag = buf.readInt32BE(24);
+    if ((compressedFlag & REPLY_COMPRESSED_FLAG) !== 0) {
+      const cp = buf.readUInt16BE(44);
+      if (cp === DATA_COMPRESSION_RLE_CP) {
+        buf = decompressReplyRLE(buf);
+      }
+    }
+  }
+
   const header = DataStream.parseHeader(buf, 0);
   const templateEnd = DataStream.HEADER_LENGTH + header.templateLen;
   const template = buf.subarray(DataStream.HEADER_LENGTH, templateEnd);
@@ -81,6 +102,56 @@ export function parseReply(buf) {
     codePoints,
     raw: buf,
   };
+}
+
+/**
+ * Decompress an RLE-compressed reply buffer into a fresh buffer.
+ *
+ * Incoming layout (from JTOpen DBBaseReplyDS.java / DataStreamCompression.java):
+ *   bytes 0-3    LL   = compressed total length (== buf.length)
+ *   bytes 4-19   rest of the 20-byte header (copied through verbatim)
+ *   bytes 20-39  template (copied through verbatim; compression flag is
+ *                in template[4..7] at absolute offset 24)
+ *   bytes 40-43  ll   = compressed-data length + 10
+ *   bytes 44-45  CP   = 0x3832 (already verified by caller)
+ *   bytes 46-49  decompressed length of the payload
+ *   bytes 50+    compressed data
+ *
+ * Output layout:
+ *   bytes 0-3    LL   = 40 + decompressedLen
+ *   bytes 4-39   copied from input 4..39, with the compression flag
+ *                cleared in bytes 24..27 so downstream code sees an
+ *                ordinary reply
+ *   bytes 40+    decompressed code-point stream
+ *
+ * @param {Buffer} buf
+ * @returns {Buffer}
+ */
+function decompressReplyRLE(buf) {
+  const origLL = buf.readInt32BE(0);
+  const decompressedLen = buf.readInt32BE(46);
+  const compressedDataStart = 50;
+  const compressedDataLen = origLL - compressedDataStart;
+  if (compressedDataLen <= 0) {
+    throw new DatastreamError('RLE reply: compressed-data region is empty');
+  }
+
+  const out = Buffer.alloc(40 + decompressedLen);  // zero-filled for empty-dest optimization
+  // New LL
+  out.writeInt32BE(40 + decompressedLen, 0);
+  // Header (4..19) and template (20..39) verbatim
+  buf.copy(out, 4, 4, 40);
+  // Clear the compression flag in the template so downstream isn't confused.
+  const tmpFlag = out.readInt32BE(24);
+  out.writeInt32BE((tmpFlag & ~REPLY_COMPRESSED_FLAG) >>> 0, 24);
+
+  const written = decompressRLE(buf, compressedDataStart, compressedDataLen, out, 40);
+  if (written !== decompressedLen) {
+    throw new DatastreamError(`RLE reply: decompressed ${written} bytes but header claimed ${decompressedLen}`, {
+      bufferOffsets: { start: compressedDataStart, end: origLL },
+    });
+  }
+  return out;
 }
 
 /**

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pcml version="6.0">
+  <program name="QUSRJOBI" path="/QSYS.LIB/QUSRJOBI.PGM">
+    <data name="receiver" type="struct" struct="JOBI0100" usage="output"
+          outputsize="receiverLength" />
+    <data name="receiverLength" type="int" length="4" usage="input"
+          init="86" />
+    <data name="formatName" type="char" length="8" usage="input"
+          init="JOBI0100" />
+    <data name="qualifiedJobName" type="char" length="26" usage="input"
+          init="*" />
+    <data name="internalJobId" type="byte" length="16" usage="input"
+          init="" />
+    <data name="errorCode" type="struct" struct="errorCode" usage="input" />
+  </program>
+
+  <struct name="JOBI0100">
+    <data name="bytesReturned" type="int" length="4" />
+    <data name="bytesAvailable" type="int" length="4" />
+    <data name="jobName" type="char" length="10" />
+    <data name="userName" type="char" length="10" />
+    <data name="jobNumber" type="char" length="6" />
+    <data name="internalJobId" type="byte" length="16" />
+    <data name="jobStatus" type="char" length="10" />
+    <data name="jobType" type="char" length="1" />
+    <data name="jobSubtype" type="char" length="1" />
+    <data name="reserved" type="byte" length="2" />
+    <data name="runPriority" type="int" length="4" />
+    <data name="timeSlice" type="int" length="4" />
+    <data name="defaultWait" type="int" length="4" />
+    <data name="purge" type="char" length="10" />
+  </struct>
+
+  <struct name="errorCode">
+    <data name="bytesProvided" type="int" length="4" init="0" />
+    <data name="bytesAvailable" type="int" length="4" init="0" />
+  </struct>
+</pcml>

@@ -4,7 +4,14 @@
 
 JDBC is a Java standard API. Once the implementation moves to pure JavaScript, the question is not "how do we keep JDBC?" but "how do we preserve the DB2 capabilities people used through JDBC?"
 
-js400 preserves DB2 feature parity while presenting a JS-native API surface. JDBC concepts like `DriverManager`, `DataSource`, `ResultSet`, and `java.sql.Connection` do not exist in JavaScript, but every database operation they supported is available.
+js400 preserves most of the common DB2 capabilities a JTOpen JDBC caller relied on, behind a JS-native API surface. JDBC concepts like `DriverManager`, `DataSource`, `ResultSet`, and `java.sql.Connection` are exposed as JS classes (`Connection`, `PreparedStatement`, `ResultSet`, `DataSource`) so that most ports can happen one-for-one.
+
+Some features are still staged or partial — see the [SQL feature matrix](sql-feature-matrix.md) for the current coverage and gap list. Notable items that still diverge from strict JDBC parity:
+
+- full host-server OUT / INOUT decoding for `CallableStatement` (currently uses a result-set fallback)
+- server-side scrollable and updatable result sets (scroll semantics work against materialized rows)
+- generated keys wrapping only supports `INSERT` (UPDATE/DELETE/MERGE is staged)
+- XA, RowSet, and full JNDI integration are intentionally not ported
 
 ## JDBC URL migration
 
@@ -47,17 +54,22 @@ console.log(opts);
 | `java.sql.PreparedStatement` | `PreparedStatement` | From `conn.prepare()` |
 | `java.sql.CallableStatement` | `CallableStatement` | From `conn.call()` |
 | `java.sql.ResultSet` | Array of objects or async iterable | `conn.query()` returns `object[]` |
-| `java.sql.DatabaseMetaData` | `DatabaseMetaData` | From `conn.metadata()` |
-| `javax.sql.DataSource` | `sql.createPool()` | Simple factory, not JNDI |
-| `javax.sql.ConnectionPoolDataSource` | `ConnectionPool` | JS pool wrapper |
+| `java.sql.DatabaseMetaData` | `DatabaseMetaData` | From `conn.getMetaData()` / `conn.metadata()` |
+| `java.sql.ResultSetMetaData` | `ResultSetMetaData` | From `rs.getMetaData()` |
+| `java.sql.ParameterMetaData` | `ParameterMetaData` | From `stmt.getParameterMetaData()` |
+| `java.sql.SQLWarning` | `SqlWarning` | From `conn/stmt/rs.getWarnings()` |
+| `AS400JDBCDataSource` | `DataSource` | Property-based configuration with `getConnection()` |
+| `AS400JDBCConnectionPoolDataSource` | `ConnectionPoolDataSource` | Exposes `getPool()` and `getPooledConnection()` |
+| `javax.sql.PooledConnection` | Return value of `cpds.getPooledConnection()` | Supports connection/statement event listeners |
+| `javax.sql.DataSource` (simple pool) | `sql.createPool()` | Simple factory returning a `ConnectionPool` |
 | `java.sql.Savepoint` | `Savepoint` | From `conn.savepoint()` |
-| `java.sql.Blob` | `Buffer` | BLOB data returned as `Buffer` |
-| `java.sql.Clob` | `string` | CLOB data returned as `string` |
-| `SQLXML` | `SQLXML` wrapper | `await value.text()` for string |
+| `java.sql.Blob` | `Blob` wrapper | `rs.getBlob(col)` returns a `Blob`; call `await blob.toBuffer()` |
+| `java.sql.Clob` | `Clob` wrapper | `rs.getClob(col)` returns a `Clob`; call `await clob.text()` |
+| `SQLXML` | `SQLXML` wrapper | `await value.getString()` for string |
 | `java.sql.Array` | `SqlArray` wrapper | JS-friendly array access |
 | `java.sql.RowId` | `RowId` wrapper | Lightweight identifier |
 | `XAConnection` / `XADataSource` | Not ported | JTA/XA not applicable in JS |
-| `AS400JDBCObjectFactory` | Not ported | JNDI only |
+| JNDI `Referenceable` full binding | Partial (`ds.getReference()`) | Returns a plain-object descriptor; no `InitialContext.bind()` analogue |
 
 ## API mapping
 
@@ -74,11 +86,13 @@ console.log(opts);
 | `conn.rollback()` | `conn.rollback()` |
 | `conn.setSavepoint("name")` | `conn.savepoint("name")` |
 | `conn.rollback(savepoint)` | `conn.rollback(savepoint)` |
-| `conn.prepareCall("CALL ...")` | `conn.call(procedure, { in, out })` |
-| `stmt.getGeneratedKeys()` | `result.generatedKeys` |
-| `rs.getMetaData()` | `result.metadata` |
-| `conn.getMetaData()` | `conn.metadata()` |
+| `conn.prepareCall("CALL ...")` | `conn.prepareCall(procedure)` or `conn.call(procedure, { in, out })` |
+| `stmt.getGeneratedKeys()` | `stmt.getGeneratedKeys()` — returns a `ResultSet` (or `result.generatedKeys` for plain rows) |
+| `rs.getMetaData()` | `rs.getMetaData()` — returns a `ResultSetMetaData` |
+| `conn.getMetaData()` | `conn.getMetaData()` — returns a `DatabaseMetaData` |
 | `ResultSet` streaming | `for await (const row of stmt.stream())` |
+| `cstmt.registerOutParameter(i, Types.INTEGER)` | `cstmt.registerOutParameter(i, 'integer')` or pass `java.sql.Types` number |
+| `cstmt.setString("P_NAME", "X")` | `cstmt.setString("P_NAME", "X")` (after `cstmt.setParameterName(i, "P_NAME")`) |
 
 ## JDBC property mapping
 

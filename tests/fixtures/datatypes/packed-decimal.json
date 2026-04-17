@@ -1,0 +1,95 @@
+{
+  "_source": "Generated from AS400PackedDecimal.toBuffer()",
+  "_description": "Packed decimal edge cases: numDigits, numDecimalPositions, value, expected bytes",
+  "vectors": [
+    {
+      "numDigits": 5,
+      "numDecimalPositions": 2,
+      "value": "123.45",
+      "description": "Simple positive with decimals",
+      "bytes": [
+        18,
+        52,
+        95
+      ]
+    },
+    {
+      "numDigits": 5,
+      "numDecimalPositions": 2,
+      "value": "-123.45",
+      "description": "Simple negative with decimals",
+      "bytes": [
+        18,
+        52,
+        93
+      ]
+    },
+    {
+      "numDigits": 5,
+      "numDecimalPositions": 0,
+      "value": "0",
+      "description": "Zero with no decimals",
+      "bytes": [
+        0,
+        0,
+        15
+      ]
+    },
+    {
+      "numDigits": 1,
+      "numDecimalPositions": 0,
+      "value": "9",
+      "description": "Single digit max",
+      "bytes": [
+        159
+      ]
+    },
+    {
+      "numDigits": 1,
+      "numDecimalPositions": 0,
+      "value": "0",
+      "description": "Single digit zero",
+      "bytes": [
+        15
+      ]
+    },
+    {
+      "numDigits": 7,
+      "numDecimalPositions": 2,
+      "value": "12345.67",
+      "description": "7-digit packed decimal (4 bytes)",
+      "bytes": [
+        18,
+        52,
+        86,
+        127
+      ]
+    },
+    {
+      "numDigits": 9,
+      "numDecimalPositions": 2,
+      "value": "0.01",
+      "description": "Small fractional value",
+      "bytes": [
+        0,
+        0,
+        0,
+        0,
+        31
+      ]
+    },
+    {
+      "numDigits": 9,
+      "numDecimalPositions": 2,
+      "value": "-0.01",
+      "description": "Small negative fractional",
+      "bytes": [
+        0,
+        0,
+        0,
+        0,
+        29
+      ]
+    }
+  ]
+}

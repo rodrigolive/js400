@@ -1,0 +1,102 @@
+{
+  "_source": "Generated from js400 CCSID 37 mapping tables",
+  "_description": "ASCII/Unicode to EBCDIC CCSID 37 round-trip test vectors",
+  "vectors": [
+    {
+      "unicode": "HELLO",
+      "ebcdic": [
+        200,
+        197,
+        211,
+        211,
+        214
+      ]
+    },
+    {
+      "unicode": "WORLD",
+      "ebcdic": [
+        230,
+        214,
+        217,
+        211,
+        196
+      ]
+    },
+    {
+      "unicode": "hello",
+      "ebcdic": [
+        136,
+        133,
+        147,
+        147,
+        150
+      ]
+    },
+    {
+      "unicode": "ABCDEFGHIJ",
+      "ebcdic": [
+        193,
+        194,
+        195,
+        196,
+        197,
+        198,
+        199,
+        200,
+        201,
+        209
+      ]
+    },
+    {
+      "unicode": "0123456789",
+      "ebcdic": [
+        240,
+        241,
+        242,
+        243,
+        244,
+        245,
+        246,
+        247,
+        248,
+        249
+      ]
+    },
+    {
+      "unicode": " ",
+      "ebcdic": [
+        64
+      ]
+    },
+    {
+      "unicode": "$#@",
+      "ebcdic": [
+        91,
+        123,
+        124
+      ]
+    },
+    {
+      "unicode": "+-*/=",
+      "ebcdic": [
+        78,
+        96,
+        92,
+        97,
+        126
+      ]
+    },
+    {
+      "unicode": "A",
+      "ebcdic": [
+        193
+      ]
+    },
+    {
+      "unicode": "Z",
+      "ebcdic": [
+        233
+      ]
+    }
+  ]
+}

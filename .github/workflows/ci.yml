@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & sanity check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node -e "const pkg = JSON.parse(require('fs').readFileSync('package.json','utf8')); if(pkg.type !== 'module') process.exit(1)"
+        name: Verify ESM type
+      - run: node -e "import('./src/index.js').then(() => console.log('Main entry OK'))"
+        name: Validate main entry point
+
+  test-node:
+    name: Node ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['20', '22', 'current']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: node --version
+      - run: node --import ./tests/bun-test-shim.js --test 'tests/**/*.test.js'
+        name: Run unit & fixture tests
+
+  test-bun:
+    name: Bun (latest stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun --version
+      - run: bun test tests/
+        name: Run unit & fixture tests
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    if: ${{ vars.JS400_TEST_HOST != '' }}
+    environment: ibmi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun test tests/integration/
+        name: Run integration tests
+        env:
+          JS400_TEST_HOST: ${{ vars.JS400_TEST_HOST }}
+          JS400_TEST_USER: ${{ secrets.JS400_TEST_USER }}
+          JS400_TEST_PASSWORD: ${{ secrets.JS400_TEST_PASSWORD }}

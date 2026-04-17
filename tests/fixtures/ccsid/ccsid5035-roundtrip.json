@@ -1,0 +1,27 @@
+{
+  "_source": "Japanese EBCDIC CCSID 5035 test vectors",
+  "_description": "Japanese EBCDIC test vectors — basic Latin subset that maps similarly to CCSID 37",
+  "vectors": [
+    {
+      "unicode": "A",
+      "ebcdic": [
+        193
+      ],
+      "description": "Latin A maps same as CCSID 37"
+    },
+    {
+      "unicode": "0",
+      "ebcdic": [
+        240
+      ],
+      "description": "Digit 0"
+    },
+    {
+      "unicode": " ",
+      "ebcdic": [
+        64
+      ],
+      "description": "Space"
+    }
+  ]
+}

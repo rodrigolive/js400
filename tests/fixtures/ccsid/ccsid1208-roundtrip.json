@@ -1,0 +1,43 @@
+{
+  "_source": "Standard UTF-8 encoding test vectors",
+  "_description": "UTF-8 round-trip test vectors for CCSID 1208",
+  "vectors": [
+    {
+      "unicode": "Hello",
+      "utf8": [
+        72,
+        101,
+        108,
+        108,
+        111
+      ]
+    },
+    {
+      "unicode": "é",
+      "utf8": [
+        195,
+        169
+      ],
+      "description": "e-acute (2-byte UTF-8)"
+    },
+    {
+      "unicode": "€",
+      "utf8": [
+        226,
+        130,
+        172
+      ],
+      "description": "Euro sign (3-byte UTF-8)"
+    },
+    {
+      "unicode": "😀",
+      "utf8": [
+        240,
+        159,
+        152,
+        128
+      ],
+      "description": "Grinning face emoji (4-byte UTF-8)"
+    }
+  ]
+}

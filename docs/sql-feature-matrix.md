@@ -67,13 +67,18 @@ This document explicitly lists which DB2 features are supported, staged, or inte
 
 | Feature | Status | API |
 | --- | --- | --- |
-| BLOB read | Supported | Returned as `Buffer` |
-| CLOB read | Supported | Returned as `string` |
+| BLOB read (wrapper) | Supported | `rs.getBlob(col)` returns a `Blob` wrapper |
+| BLOB read (raw) | Supported | `rs.getBytes(col)` returns `Buffer` |
+| CLOB read (wrapper) | Supported | `rs.getClob(col)` returns a `Clob` wrapper |
+| CLOB read (raw) | Supported | `rs.getString(col)` returns `string` |
 | BLOB streaming | Supported | `blob.getReadableStream()` |
 | CLOB streaming | Supported | `clob.getReadableStream()` |
-| BLOB write | Supported | Pass `Buffer` as parameter |
-| CLOB write | Supported | Pass `string` as parameter |
-| SQLXML read | Supported | `await value.text()` |
+| BLOB write | Supported | Pass `Buffer` or `Blob` wrapper as parameter |
+| CLOB write | Supported | Pass `string` or `Clob` wrapper as parameter |
+| SQLXML read (wrapper) | Supported | `rs.getSQLXML(col)` returns `SQLXML` wrapper |
+| SQLXML write | Supported | Pass `SQLXML` wrapper or string via `setSQLXML()` |
+| ARRAY (locator integration) | Staged | `rs.getArray(col)` returns `SqlArray` wrapper; server-side ARRAY protocol is not yet wired |
+| ROWID (locator integration) | Staged | `rs.getRowId(col)` returns `RowId` wrapper |
 
 ## Metadata
 
@@ -89,20 +94,34 @@ This document explicitly lists which DB2 features are supported, staged, or inte
 
 ## Stored procedures
 
+> **OUT / INOUT parity is Partial, NOT Supported.** js400 does not yet
+> decode the host server's CALL reply parameter-row block (JTOpen's
+> `DBData parameterRow_`, sourced from the 0x3810-family reply code
+> points). Applications that require real protocol-level OUT retrieval
+> must either migrate those procedures to emit OUT values as a result-
+> set row (the DB2 `VALUES (...)` pattern) or wait for engine-layer
+> support.
+
 | Feature | Status | API |
 | --- | --- | --- |
 | CALL execution | Supported | `conn.call(procedure, { in, out })` |
-| IN parameters | Supported | `{ in: [value, ...] }` |
-| OUT parameters | Supported | `{ out: [{ type, ... }] }` |
-| INOUT parameters | Staged | Combined in/out parameters |
-| Multiple result sets | Staged | `result.resultSets` |
+| IN parameters | Supported | `{ in: [value, ...] }` or `cstmt.setObject(...)` |
+| OUT parameter registration | Supported | `cstmt.registerOutParameter(idx, sqlType, ...)` |
+| OUT parameter retrieval | Partial | Deterministic fallback: if the procedure emits exactly one result-set row, OUT slots are matched to columns by registered parameter name first, then declared column-descriptor order. Full host-server OUT protocol decoding is NOT implemented. |
+| INOUT parameters | Partial | IN side works; OUT side uses the same result-set fallback |
+| Named parameters | Supported | `cstmt.setString("P_NAME", ...)` after `setParameterName()` |
+| Multiple result sets | Partial | Single result set captured today; `getMoreResults()` drains the queue but only ever holds one entry |
+| Typed OUT getters | Supported | `cstmt.getString()`, `getBlob()`, `getClob()`, `getSQLXML()`, `getArray()`, `getRowId()` |
+| `wasNull()` | Supported | Tracks the last OUT getter |
 
 ## Generated keys
 
 | Feature | Status | API |
 | --- | --- | --- |
-| Return generated keys | Supported | `conn.execute(sql, params, { returnGeneratedKeys: true })` |
-| Access generated keys | Supported | `result.generatedKeys` |
+| Return generated keys (INSERT) | Supported | `stmt.execute(params, { returnGeneratedKeys: true })` rewrites as `SELECT * FROM FINAL TABLE (INSERT ...)` |
+| Access generated keys as rows | Supported | `result.generatedKeys` |
+| Access generated keys as ResultSet | Supported | `stmt.getGeneratedKeys()` — cleared at the start of every subsequent `execute()` |
+| Generated keys for UPDATE/DELETE/MERGE | Staged | DB2 `FINAL TABLE` supports it, but the wrapper only rewrites INSERT today |
 
 ## Batching
 
@@ -131,17 +150,38 @@ This document explicitly lists which DB2 features are supported, staged, or inte
 | Statement timeout | Staged | Future: timeout option on queries |
 | AbortSignal cancellation | Staged | Future: pass `signal` to operations |
 
+## JDBC metadata objects
+
+| Feature | Status | API |
+| --- | --- | --- |
+| `ResultSetMetaData` as a separate object | Supported | `rs.getMetaData()` returns a `ResultSetMetaData` |
+| `ParameterMetaData` as a separate object | Supported | `stmt.getParameterMetaData()` returns a `ParameterMetaData` |
+| `DatabaseMetaData` | Supported | `conn.getMetaData()` returns a `DatabaseMetaData` |
+| `SQLWarning` chain | Supported | `conn/stmt/rs.getWarnings()` returns a `SqlWarning` chain |
+
+## DataSource / configuration surface
+
+| Feature | Status | API |
+| --- | --- | --- |
+| JDBC URL `jdbc:as400://` parsing | Supported | `sql.parseJdbcUrl()` |
+| `DataSource` with JTOpen property surface | Supported | `new DataSource(); ds.setServerName(...); ds.getConnection()` |
+| `ConnectionPoolDataSource` (pool lifecycle) | Supported | `cpds.getPool()` returns a `ConnectionPool`; `cpds.getPooledConnection()` checks out via `pool.getConnection()` and logical `close()` returns the physical connection to the pool |
+| `PooledConnection` event listeners | Partial | `addConnectionEventListener` fires `connectionClosed` exactly once on logical close; `addStatementEventListener` accepts listeners but no statement events are emitted yet |
+| `getPooledConnection(user, password)` (credentials branch) | Partial | Opens a fresh physical connection and bypasses the pool; logical `close()` physically closes it. No credential-keyed pool sub-partitioning yet. |
+| JNDI `Referenceable` | Partial | `ds.getReference()` returns a plain-object descriptor; full JNDI `Context.bind()` is Java-only |
+| Driver properties (extendedDynamic, packageCache, blockSize, etc.) | Stored only | Stored verbatim on the DataSource and threaded through `connect()`. Most do NOT yet drive new runtime behavior. |
+| Client reroute / affinity | Stored only | Configuration accepted but the reroute / failover logic is not implemented |
+
 ## Intentionally unsupported
 
 | Feature | Reason |
 | --- | --- |
-| XA transactions | JTA/XA is a Java enterprise pattern with no JS equivalent |
-| JNDI DataSource | Java naming integration does not map to JS modules |
+| XA transactions | JTA/XA is a Java enterprise pattern with no direct JS equivalent |
+| Full JNDI integration | Java naming integration does not map to JS modules |
 | JDBC RowSet wrappers | Java-specific convenience; use arrays and iterables |
-| DriverManager | Java service-provider pattern; use `sql.connect()` |
-| Connection redirect | Java-specific failover mechanism |
+| DriverManager service-provider loading | Use `sql.connect()` or `new DataSource()` directly |
 | Java stream adapters (`InputStream`, `OutputStream`, `Reader`, `Writer`) | Use Node.js streams and `Buffer` |
-| ResultSetMetaData as separate object | Inline in result objects |
-| ParameterMetaData as separate object | Inline in prepared statement |
+| Swing/`vaccess` SQL UI classes | Out of scope |
+| `com.ibm.as400.micro` JDBC-ME | Out of scope |
 
 Source: [`src/db/index.js`](../src/db/index.js), [`src/db/properties.js`](../src/db/properties.js)

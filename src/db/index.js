@@ -8,14 +8,35 @@
 export { connect, createPool, parseJdbcUrl } from './connect.js';
 
 // --- Public API layer ---
-export { Connection } from './api/Connection.js';
-export { Statement } from './api/Statement.js';
-export { PreparedStatement } from './api/PreparedStatement.js';
+export { Connection, TransactionIsolation } from './api/Connection.js';
+export { DataSource, ConnectionPoolDataSource } from './api/DataSource.js';
+export {
+  Statement,
+  SUCCESS_NO_INFO, EXECUTE_FAILED,
+  RETURN_GENERATED_KEYS, NO_GENERATED_KEYS,
+  CLOSE_CURRENT_RESULT, KEEP_CURRENT_RESULT, CLOSE_ALL_RESULTS,
+} from './api/Statement.js';
+export { PreparedStatement, SQL_NULL } from './api/PreparedStatement.js';
+export { PreparedStatementCache } from './api/PreparedStatementCache.js';
 export { CallableStatement } from './api/CallableStatement.js';
-export { ResultSet } from './api/ResultSet.js';
-export { DatabaseMetaData } from './api/DatabaseMetaData.js';
+export {
+  ResultSet, FetchDirection, ResultSetType,
+  ResultSetConcurrency, ResultSetHoldability,
+} from './api/ResultSet.js';
+export {
+  ResultSetMetaData, JdbcType, ColumnNullable,
+  hostTypeToJdbc, hostTypeToClassName,
+} from './api/ResultSetMetaData.js';
+export {
+  ParameterMetaData, ParameterMode, ParameterNullable,
+} from './api/ParameterMetaData.js';
+export {
+  DatabaseMetaData, BestRowScope, BestRowNullable,
+  VersionColumnPseudo, ForeignKeyRule,
+} from './api/DatabaseMetaData.js';
 export { SqlArray } from './api/SqlArray.js';
 export { RowId } from './api/RowId.js';
+export { SqlWarning } from './api/SqlWarning.js';
 
 // --- LOB wrappers ---
 export { Blob } from './lob/Blob.js';

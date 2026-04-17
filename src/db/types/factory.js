@@ -28,16 +28,25 @@ registerAll(lobTypes);
 registerAll(specialTypes);
 
 /**
- * Look up a type handler by the server's SQL type code.
- * The type code is the absolute value with the low bit masked off
- * (the low bit indicates nullable).
+ * Look up a type handler by SQL type code.
  *
- * @param {number} sqlType - SQL type code from column descriptor
+ * Positive codes (server descriptor values like DECIMAL=484) are matched
+ * by `sqlType & 0xFFFE` (low bit masks the nullable indicator).
+ *
+ * Negative codes (driver-internal extended types like NVARCHAR=-0x01E4,
+ * XML=-370, BOOLEAN=-0x01FC) are matched by their SIGNED masked value so
+ * they don't collide with positive numeric types that share the same
+ * absolute value (e.g. DECIMAL(484) vs NVARCHAR(-484)).
+ *
+ * @param {number} sqlType
  * @returns {{ decode: Function, encode: Function, name: string } | null}
  */
 export function getTypeHandler(sqlType) {
-  const key = Math.abs(sqlType) & 0xFFFE;
-  return allTypes.get(key) ?? null;
+  if (sqlType < 0) {
+    const signedKey = -(Math.abs(sqlType) & 0xFFFE);
+    return allTypes.get(signedKey) ?? null;
+  }
+  return allTypes.get(sqlType & 0xFFFE) ?? null;
 }
 
 /**

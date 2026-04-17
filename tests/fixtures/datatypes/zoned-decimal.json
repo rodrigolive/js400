@@ -1,0 +1,78 @@
+{
+  "_source": "Generated from AS400ZonedDecimal.toBuffer()",
+  "_description": "Zoned decimal edge cases: numDigits, numDecimalPositions, value, expected bytes",
+  "vectors": [
+    {
+      "numDigits": 5,
+      "numDecimalPositions": 2,
+      "value": "123.45",
+      "description": "Simple positive (zone=0xF on all including last)",
+      "bytes": [
+        241,
+        242,
+        243,
+        244,
+        245
+      ]
+    },
+    {
+      "numDigits": 5,
+      "numDecimalPositions": 2,
+      "value": "-123.45",
+      "description": "Negative: last byte zone=0xD",
+      "bytes": [
+        241,
+        242,
+        243,
+        244,
+        213
+      ]
+    },
+    {
+      "numDigits": 3,
+      "numDecimalPositions": 0,
+      "value": "0",
+      "description": "Zero integer",
+      "bytes": [
+        240,
+        240,
+        240
+      ]
+    },
+    {
+      "numDigits": 1,
+      "numDecimalPositions": 0,
+      "value": "9",
+      "description": "Single digit max",
+      "bytes": [
+        249
+      ]
+    },
+    {
+      "numDigits": 3,
+      "numDecimalPositions": 0,
+      "value": "-1",
+      "description": "Negative one padded",
+      "bytes": [
+        240,
+        240,
+        209
+      ]
+    },
+    {
+      "numDigits": 7,
+      "numDecimalPositions": 3,
+      "value": "9999.999",
+      "description": "Max value for 7 digits",
+      "bytes": [
+        249,
+        249,
+        249,
+        249,
+        249,
+        249,
+        249
+      ]
+    }
+  ]
+}

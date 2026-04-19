@@ -222,6 +222,22 @@ await pool.close();
 | `isolation` | `string` | `'read-uncommitted'` | Transaction isolation level |
 | `autoCommit` | `boolean` | `true` | Auto-commit mode |
 | `blockSize` | `number` | `32` | Fetch block size (0-512) |
+| `extendedDynamic` | `boolean` | `false` | Enable server-side SQL package (see [SQL Packages](sql-packages.md)) |
+| `sqlPackage` | `string` | | Package name when `extendedDynamic` is on |
+| `packageLibrary` | `string` | `'QGPL'` | Library the package lives in |
+| `packageCache` | `boolean` | `false` | Fetch the package blob after create |
+| `packageError` | `string` | `'warning'` | `CREATE_PACKAGE` failure policy: `'none'`, `'warning'`, or `'exception'` |
+| `holdStatements` | `boolean` | `false` | Cursor hold across `COMMIT` (`HOLD_INDICATOR` on wire) |
+
+## Cancel and query timeout
+
+Long-running queries can be interrupted with `stmt.cancel()` or
+`stmt.setQueryTimeout(n)` — js400 routes both through a lazily-
+opened side-channel DATABASE connection that issues
+`FUNCTIONID_CANCEL` (`0x1818`), mirroring JTOpen's two-connection
+cancel model. The default path pays two boolean checks and no
+timer when `queryTimeout = 0` and no cancel() is in flight. See
+[Cancel and Query Timeout](sql-cancel.md).
 
 ## Close
 

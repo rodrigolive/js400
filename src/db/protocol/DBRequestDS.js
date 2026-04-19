@@ -15,6 +15,7 @@ import {
   MIN_SAVINGS_BYTES,
   MIN_SAVINGS_PERCENT,
 } from '../compression/rle.js';
+import { CharConverter } from '../../ccsid/CharConverter.js';
 
 /** Server ID for the database host server. */
 const SERVER_ID = 0xE004;
@@ -129,6 +130,7 @@ export const OpenAttributes = Object.freeze({
   READ_ONLY:        0x80,
   WRITE_ONLY:       0x40,
   READ_WRITE:       0xC0,
+  ALL:              0xF0,
 });
 
 /** Describe option values. */
@@ -209,19 +211,29 @@ function encodeUtf16BE(str) {
 
 /**
  * Build a text code point (LL/CP with CCSID + length prefix).
- * Layout: LL(4) + CP(2) + CCSID(2) + textLength(2) + UTF-16BE text
- * Per jtopenlite writePrepareStatementName / writeCursorName.
+ * Layout: LL(4) + CP(2) + CCSID(2) + textLength(2) + encoded text.
+ *
+ * For SQL statement text js400 still defaults to Unicode (CCSID 13488),
+ * matching the existing working path. For identifier-like code points
+ * (cursor name, statement name, library/package name) callers can pass
+ * the server/job CCSID so the host stores the name exactly the same way
+ * JTOpen does through its connection converter.
+ *
+ * Per JTOpen DBBaseRequestDS.addParameter(int, ConvTable, String).
  * @param {number} cp - code point
  * @param {string} text
+ * @param {number} [ccsid=13488]
  * @returns {Buffer}
  */
-function buildTextCP(cp, text) {
-  const textBuf = encodeUtf16BE(text);
+function buildTextCP(cp, text, ccsid = UNICODE_CCSID) {
+  const textBuf = ccsid === UNICODE_CCSID
+    ? encodeUtf16BE(text)
+    : CharConverter.stringToByteArray(text, ccsid);
   const ll = 10 + textBuf.length;
   const buf = Buffer.alloc(ll);
   buf.writeInt32BE(ll, 0);
   buf.writeUInt16BE(cp, 4);
-  buf.writeUInt16BE(UNICODE_CCSID, 6);
+  buf.writeUInt16BE(ccsid, 6);
   buf.writeUInt16BE(textBuf.length, 8);
   textBuf.copy(buf, 10);
   return buf;
@@ -422,11 +434,12 @@ export class DBRequestDS {
    */
   static buildCreateRPB(opts) {
     const cps = [];
+    const identifierCcsid = opts.identifierCcsid ?? UNICODE_CCSID;
 
-    if (opts.cursorName) cps.push(buildTextCP(CodePoint.CURSOR_NAME, opts.cursorName));
-    if (opts.statementName) cps.push(buildTextCP(CodePoint.PREPARED_STATEMENT_NAME, opts.statementName));
-    if (opts.libraryName) cps.push(buildTextCP(CodePoint.LIBRARY_NAME, opts.libraryName));
-    if (opts.packageName) cps.push(buildTextCP(CodePoint.PACKAGE_NAME, opts.packageName));
+    if (opts.cursorName) cps.push(buildTextCP(CodePoint.CURSOR_NAME, opts.cursorName, identifierCcsid));
+    if (opts.statementName) cps.push(buildTextCP(CodePoint.PREPARED_STATEMENT_NAME, opts.statementName, identifierCcsid));
+    if (opts.libraryName) cps.push(buildTextCP(CodePoint.LIBRARY_NAME, opts.libraryName, identifierCcsid));
+    if (opts.packageName) cps.push(buildTextCP(CodePoint.PACKAGE_NAME, opts.packageName, identifierCcsid));
     if (opts.translateIndicator != null) cps.push(buildByteCP(CodePoint.TRANSLATE_INDICATOR, opts.translateIndicator));
     if (opts.prepareOption != null) cps.push(buildByteCP(CodePoint.PREPARE_OPTION, opts.prepareOption));
     if (opts.openAttributes != null) cps.push(buildByteCP(CodePoint.OPEN_ATTRIBUTES, opts.openAttributes));
@@ -472,7 +485,13 @@ export class DBRequestDS {
    */
   static buildPrepare(opts) {
     const cps = [];
-    if (opts.statementName) cps.push(buildTextCP(CodePoint.PREPARED_STATEMENT_NAME, opts.statementName));
+    if (opts.statementName) {
+      cps.push(buildTextCP(
+        CodePoint.PREPARED_STATEMENT_NAME,
+        opts.statementName,
+        opts.identifierCcsid ?? UNICODE_CCSID,
+      ));
+    }
     cps.push(buildExtTextCP(CodePoint.EXTENDED_SQL_STATEMENT_TEXT, opts.sqlText));
     if (opts.prepareOption != null) cps.push(buildByteCP(CodePoint.PREPARE_OPTION, opts.prepareOption));
     if (opts.translateIndicator != null) cps.push(buildByteCP(CodePoint.TRANSLATE_INDICATOR, opts.translateIndicator));
@@ -506,7 +525,13 @@ export class DBRequestDS {
    */
   static buildPrepareAndDescribe(opts) {
     const cps = [];
-    if (opts.statementName) cps.push(buildTextCP(CodePoint.PREPARED_STATEMENT_NAME, opts.statementName));
+    if (opts.statementName) {
+      cps.push(buildTextCP(
+        CodePoint.PREPARED_STATEMENT_NAME,
+        opts.statementName,
+        opts.identifierCcsid ?? UNICODE_CCSID,
+      ));
+    }
     cps.push(buildExtTextCP(CodePoint.EXTENDED_SQL_STATEMENT_TEXT, opts.sqlText));
     if (opts.statementType != null) cps.push(buildShortCP(CodePoint.STATEMENT_TYPE, opts.statementType));
     if (opts.prepareOption != null) cps.push(buildByteCP(CodePoint.PREPARE_OPTION, opts.prepareOption));
@@ -707,6 +732,10 @@ export class DBRequestDS {
    * @param {number} opts.rpbId
    * @param {Buffer} [opts.parameterMarkerData] - encoded parameter values
    * @param {Buffer} [opts.extendedParameterData] - extended format params
+   * @param {boolean} [opts.requestOutputData=false] - set ORS RESULT_DATA bit
+   *   so the server returns the CALL reply's OUT/INOUT parameter row as
+   *   code point 0x380E. Only used by the callable path — DML does not
+   *   set this bit.
    * @returns {Buffer}
    */
   static buildExecute(opts) {
@@ -718,9 +747,11 @@ export class DBRequestDS {
     }
     if (opts.extendedParameterData) cps.push(buildRawCP(CodePoint.EXTENDED_COLUMN_DESCRIPTORS, opts.extendedParameterData));
 
+    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA;
+    if (opts.requestOutputData) orsBitmap |= ORSBitmap.RESULT_DATA;
     const template = Buffer.alloc(TEMPLATE_LENGTH);
     writeTemplate(template, 0, {
-      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA,
+      orsBitmap,
       rpbId: opts.rpbId,
       paramCount: cps.length,
       pmDescriptorHandle: opts.pmDescriptorHandle ?? 0,
@@ -736,6 +767,9 @@ export class DBRequestDS {
    * @param {number} [opts.blockingFactor=0]
    * @param {number} [opts.describeOption=1]
    * @param {number} [opts.scrollable]
+   * @param {boolean} [opts.requestResultData=false] - when true, use the
+   *   OPEN_DESCRIBE_FETCH request shape so the first block of rows is
+   *   returned inline with the open reply.
    * @param {number} [opts.resultDescriptorHandle=0]
    * @param {string} [opts.cursorName]
    * @param {Buffer} [opts.parameterMarkerData]
@@ -743,11 +777,12 @@ export class DBRequestDS {
    */
   static buildOpenAndDescribe(opts) {
     const cps = [];
+    const identifierCcsid = opts.identifierCcsid ?? UNICODE_CCSID;
     if (opts.blockingFactor != null) cps.push(buildIntCP(CodePoint.BLOCKING_FACTOR, opts.blockingFactor));
     if (opts.describeOption != null) cps.push(buildByteCP(CodePoint.DESCRIBE_OPTION, opts.describeOption));
     if (opts.openAttributes != null) cps.push(buildByteCP(CodePoint.OPEN_ATTRIBUTES, opts.openAttributes));
     if (opts.scrollable != null) cps.push(buildByteCP(CodePoint.SCROLLABLE_CURSOR_FLAG, opts.scrollable));
-    if (opts.cursorName) cps.push(buildTextCP(CodePoint.CURSOR_NAME, opts.cursorName));
+    if (opts.cursorName) cps.push(buildTextCP(CodePoint.CURSOR_NAME, opts.cursorName, identifierCcsid));
     // Include inline parameter format (0x3801) if provided
     if (opts.parameterMarkerFormat) cps.push(buildRawCP(0x3801, opts.parameterMarkerFormat));
     // Parameter marker data
@@ -756,15 +791,21 @@ export class DBRequestDS {
     }
 
     const template = Buffer.alloc(TEMPLATE_LENGTH);
+    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA
+                  | ORSBitmap.MESSAGE_ID | ORSBitmap.FIRST_LEVEL_TEXT | ORSBitmap.SECOND_LEVEL_TEXT;
+    let requestId = RequestID.OPEN_AND_DESCRIBE;
+    if (opts.requestResultData) {
+      orsBitmap |= ORSBitmap.DATA_FORMAT | ORSBitmap.RESULT_DATA;
+      requestId = RequestID.OPEN_DESCRIBE_FETCH;
+    }
     writeTemplate(template, 0, {
-      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA
-               | ORSBitmap.MESSAGE_ID | ORSBitmap.FIRST_LEVEL_TEXT | ORSBitmap.SECOND_LEVEL_TEXT,
+      orsBitmap,
       rpbId: opts.rpbId,
       paramCount: cps.length,
       pmDescriptorHandle: opts.pmDescriptorHandle ?? 0,
     });
 
-    return assemblePacket(RequestID.OPEN_AND_DESCRIBE, TEMPLATE_LENGTH, template, cps);
+    return assemblePacket(requestId, TEMPLATE_LENGTH, template, cps);
   }
 
   /**
@@ -781,8 +822,11 @@ export class DBRequestDS {
    */
   static buildExecuteOrOpenDescribe(opts) {
     const cps = [];
-    if (opts.statementName) cps.push(buildTextCP(CodePoint.PREPARED_STATEMENT_NAME, opts.statementName));
-    if (opts.cursorName) cps.push(buildTextCP(CodePoint.CURSOR_NAME, opts.cursorName));
+    const identifierCcsid = opts.identifierCcsid ?? UNICODE_CCSID;
+    if (opts.statementName) {
+      cps.push(buildTextCP(CodePoint.PREPARED_STATEMENT_NAME, opts.statementName, identifierCcsid));
+    }
+    if (opts.cursorName) cps.push(buildTextCP(CodePoint.CURSOR_NAME, opts.cursorName, identifierCcsid));
     if (opts.openAttributes != null) cps.push(buildByteCP(CodePoint.OPEN_ATTRIBUTES, opts.openAttributes));
     if (opts.describeOption != null) cps.push(buildByteCP(CodePoint.DESCRIBE_OPTION, opts.describeOption));
     if (opts.blockingFactor != null) cps.push(buildIntCP(CodePoint.BLOCKING_FACTOR, opts.blockingFactor));
@@ -791,8 +835,12 @@ export class DBRequestDS {
     if (opts.extendedParameterData) cps.push(buildRawCP(CodePoint.EXTENDED_COLUMN_DESCRIPTORS, opts.extendedParameterData));
 
     const template = Buffer.alloc(TEMPLATE_LENGTH);
+    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT | ORSBitmap.SQLCA;
+    if (opts.requestResultData !== false) {
+      orsBitmap |= ORSBitmap.RESULT_DATA;
+    }
     writeTemplate(template, 0, {
-      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT | ORSBitmap.SQLCA | ORSBitmap.RESULT_DATA,
+      orsBitmap,
       rpbId: opts.rpbId,
       paramCount: cps.length,
     });
@@ -874,7 +922,13 @@ export class DBRequestDS {
    */
   static buildPrepareAndExecute(opts) {
     const cps = [];
-    if (opts.statementName) cps.push(buildTextCP(CodePoint.PREPARED_STATEMENT_NAME, opts.statementName));
+    if (opts.statementName) {
+      cps.push(buildTextCP(
+        CodePoint.PREPARED_STATEMENT_NAME,
+        opts.statementName,
+        opts.identifierCcsid ?? UNICODE_CCSID,
+      ));
+    }
     cps.push(buildTextCP(CodePoint.SQL_STATEMENT_TEXT, opts.sqlText));
     if (opts.parameterMarkerData) cps.push(buildRawCP(CodePoint.PARAMETER_MARKER_DATA, opts.parameterMarkerData));
     if (opts.prepareOption != null) cps.push(buildByteCP(CodePoint.PREPARE_OPTION, opts.prepareOption));

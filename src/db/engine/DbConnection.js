@@ -30,6 +30,7 @@ export class DbConnection {
   #system;
   #connection;
   #properties;
+  #userOpts;
   #connected;
   #serverCCSID;
   #serverVersion;
@@ -44,7 +45,10 @@ export class DbConnection {
 
   /**
    * @param {import('../../core/AS400.js').AS400} system - authenticated AS400 instance
-   * @param {object} [opts] - connection properties
+   * @param {object} [opts] - normalized connection properties
+   * @param {object} [rawOpts] - caller-supplied properties before default
+   *   merging; kept so engine knobs can distinguish explicit opt-in from
+   *   library defaults.
    * @param {string} [opts.naming='sql']
    * @param {string[]} [opts.libraries=[]]
    * @param {string} [opts.dateFormat]
@@ -55,9 +59,16 @@ export class DbConnection {
    * @param {string} [opts.defaultSchema]
    * @param {object} [opts.sortSequence]
    */
-  constructor(system, opts = {}) {
+  constructor(system, opts = {}, rawOpts = opts) {
     this.#system = system;
     this.#properties = { ...defaultProperties, ...opts };
+    // Retain the pre-normalization opts bag so engine-level knobs that
+    // should only fire on explicit opt-in (e.g. holdStatements,
+    // blockSize) can distinguish "user set this" from "library default
+    // merged in." Passing the normalized bag here would make defaults
+    // like blockSize=32 look explicit and silently change runtime
+    // behavior for callers who never asked for it.
+    this.#userOpts = rawOpts || {};
     this.#connected = false;
     this.#serverCCSID = 37;
     this.#serverVersion = 0;
@@ -126,8 +137,27 @@ export class DbConnection {
 
     Trace.log(Trace.JDBC, `Database connected: CCSID=${this.#serverCCSID} DSLevel=${this.#serverDatastreamLevel}`);
 
-    // Step 5: Initialize managers
-    const managerOpts = { serverCCSID: this.#serverCCSID };
+    // Step 5: Initialize managers.
+    //
+    // Explicit opt-in knobs — only applied when the caller set them;
+    // otherwise the engine keeps its prior defaults so existing
+    // callers see zero behavior change when the knob is off.
+    const managerOpts = {
+      serverCCSID: this.#serverCCSID,
+      holdIndicator: this.#explicitHoldIndicator(this.#userOpts),
+      // Performance knobs in plumbing-only state per boss's
+      // first-pass rule: surfaced on the engine for counter
+      // visibility and for a future pass to act on, but not
+      // wired to any wire-shape change yet. The fast path is
+      // unchanged when these are unset.
+      extendedDynamic: this.#explicitBoolean(this.#userOpts, 'extendedDynamic'),
+      packageCache: this.#explicitBoolean(this.#userOpts, 'packageCache'),
+      blockSizeKB: this.#explicitNumber(this.#userOpts, 'blockSize'),
+      packageName: typeof this.#userOpts?.sqlPackage === 'string'
+        ? this.#userOpts.sqlPackage : null,
+      packageLibrary: typeof this.#userOpts?.packageLibrary === 'string'
+        ? this.#userOpts.packageLibrary : null,
+    };
     this.#cursorManager = new CursorManager(this.#connection, managerOpts);
     this.#statementManager = new StatementManager(this.#connection, this.#cursorManager, managerOpts);
     this.#transactionManager = new TransactionManager(this.#connection, {
@@ -192,11 +222,14 @@ export class DbConnection {
   /**
    * Prepare a SQL statement.
    * @param {string} sql
+   * @param {object} [opts]
+   * @param {string} [opts.cursorName] - explicit cursor name for
+   *   positioned UPDATE/DELETE; pass-through to StatementManager.
    * @returns {Promise<PreparedStatementHandle>}
    */
-  async prepareStatement(sql) {
+  async prepareStatement(sql, opts) {
     this.#ensureConnected();
-    return this.#statementManager.prepareStatement(sql);
+    return this.#statementManager.prepareStatement(sql, opts);
   }
 
   /**
@@ -279,5 +312,44 @@ export class DbConnection {
     if (!this.#connected) {
       throw new Error('Database connection is not open. Call connect() first.');
     }
+  }
+
+  /**
+   * Translate the JTOpen `holdStatements` boolean (or explicit numeric
+   * HOLD_INDICATOR byte) into the wire value passed to CREATE RPB.
+   * Returns `null` unless the caller *explicitly* set the property,
+   * leaving DB2 on its default behavior (cursor closes at commit).
+   * Accepted forms: `true` / `false`, or a numeric byte.
+   */
+  /**
+   * Read a *boolean* opt only if the caller explicitly set it.
+   * Returns `null` (not `false`) when the property is absent so
+   * downstream code can distinguish "user said off" from "user
+   * didn't say". This is the same opt-in discipline the
+   * `holdStatements` knob uses — a future runtime change behind a
+   * knob can detect both states without surprising defaults.
+   */
+  #explicitBoolean(opts, name) {
+    if (!opts || !Object.prototype.hasOwnProperty.call(opts, name)) {
+      return null;
+    }
+    return Boolean(opts[name]);
+  }
+
+  #explicitNumber(opts, name) {
+    if (!opts || !Object.prototype.hasOwnProperty.call(opts, name)) {
+      return null;
+    }
+    const n = Number(opts[name]);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  #explicitHoldIndicator(opts) {
+    if (!opts || !Object.prototype.hasOwnProperty.call(opts, 'holdStatements')) {
+      return null;
+    }
+    const v = opts.holdStatements;
+    if (typeof v === 'number') return v & 0xFF;
+    return v ? 0x01 : 0x00;
   }
 }

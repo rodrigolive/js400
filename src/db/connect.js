@@ -39,7 +39,7 @@ export async function connect(systemOrUrl, opts = {}) {
   } else {
     // AS400 system instance
     const normalized = normalizeProperties(opts);
-    const db = new DbConnection(systemOrUrl, normalized);
+    const db = new DbConnection(systemOrUrl, normalized, opts);
     await db.connect();
     return new Connection(db);
   }
@@ -55,9 +55,9 @@ export async function connect(systemOrUrl, opts = {}) {
       port: connOpts.port,
       secure: connOpts.secure ?? false,
     });
-    await system.connect();
+    await system.signon();
     const normalized = normalizeProperties(connOpts);
-    const db = new DbConnection(system, normalized);
+    const db = new DbConnection(system, normalized, connOpts);
     await db.connect();
     return new Connection(db);
   }

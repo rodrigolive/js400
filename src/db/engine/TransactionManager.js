@@ -63,22 +63,23 @@ export class TransactionManager {
   async setSavepoint(name) {
     const sp = new Savepoint(name);
     const sql = `SAVEPOINT "${sp.name}" ON ROLLBACK RETAIN CURSORS`;
-    await this.#executeImmediate(sql);
+    const sqlca = await this.#executeImmediate(sql);
     this.#savepoints.set(sp.name, sp);
-    return sp;
+    return { savepoint: sp, sqlca };
   }
 
   async rollbackToSavepoint(savepoint) {
     const name = typeof savepoint === 'string' ? savepoint : savepoint.name;
     const sql = `ROLLBACK TO SAVEPOINT "${name}"`;
-    await this.#executeImmediate(sql);
+    return this.#executeImmediate(sql);
   }
 
   async releaseSavepoint(savepoint) {
     const name = typeof savepoint === 'string' ? savepoint : savepoint.name;
     const sql = `RELEASE SAVEPOINT "${name}"`;
-    await this.#executeImmediate(sql);
+    const sqlca = await this.#executeImmediate(sql);
     this.#savepoints.delete(name);
+    return sqlca;
   }
 
   async #executeImmediate(sql) {

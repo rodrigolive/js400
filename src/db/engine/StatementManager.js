@@ -46,13 +46,99 @@ function stripLeadingComments(sql) {
 }
 
 function inferStatementType(sql) {
-  const text = stripLeadingComments(sql).toUpperCase();
+  let text = stripLeadingComments(sql).toUpperCase();
+  // JDBC function-return form: `? = CALL FUNC(...)`. The leading `?=`
+  // must not defeat CALL classification — otherwise the engine skips
+  // ORS RESULT_DATA and the parameter-row decode, and the caller
+  // silently gets no OUT / return value back. Strip it before the
+  // keyword check.
+  const retStripped = /^\?\s*=\s*/.exec(text);
+  if (retStripped) text = text.slice(retStripped[0].length);
 
   if (text.startsWith('SELECT')) return StatementType.SELECT;
   if (text.startsWith('CALL')) return StatementType.CALL;
   if (text.startsWith('COMMIT')) return StatementType.COMMIT;
   if (text.startsWith('ROLLBACK')) return StatementType.ROLLBACK;
   return StatementType.OTHER;
+}
+
+function tokenizeSqlKeywords(sql) {
+  const tokens = [];
+  let token = '';
+  let i = 0;
+  const text = String(sql ?? '');
+
+  const flush = () => {
+    if (token.length > 0) {
+      tokens.push(token.toUpperCase());
+      token = '';
+    }
+  };
+
+  while (i < text.length) {
+    const ch = text[i];
+    const next = text[i + 1];
+
+    if (ch === '-' && next === '-') {
+      flush();
+      i += 2;
+      while (i < text.length && text[i] !== '\n') i++;
+      continue;
+    }
+
+    if (ch === '/' && next === '*') {
+      flush();
+      i += 2;
+      while (i + 1 < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+      i = Math.min(i + 2, text.length);
+      continue;
+    }
+
+    if (ch === '\'' || ch === '"') {
+      flush();
+      const quote = ch;
+      i++;
+      while (i < text.length) {
+        if (text[i] === quote) {
+          if (text[i + 1] === quote) {
+            i += 2;
+            continue;
+          }
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+
+    if (/[A-Za-z0-9_$]/.test(ch)) {
+      token += ch;
+      i++;
+      continue;
+    }
+
+    flush();
+    i++;
+  }
+
+  flush();
+  return tokens;
+}
+
+function isForUpdateSelect(sql) {
+  if (inferStatementType(sql) !== StatementType.SELECT) return false;
+  const tokens = tokenizeSqlKeywords(sql);
+  for (let i = 0; i < tokens.length - 1; i++) {
+    if (tokens[i] === 'FOR' && tokens[i + 1] === 'UPDATE') return true;
+  }
+  return false;
+}
+
+function getOpenAttributesForSql(sql) {
+  return isForUpdateSelect(sql)
+    ? OpenAttributes.ALL
+    : OpenAttributes.READ_ONLY;
 }
 
 function isResizableParameterType(sqlType) {
@@ -94,24 +180,96 @@ export class StatementManager {
     this.#serverCCSID = opts.serverCCSID ?? 37;
     this.#cursorManager = cursorManager;
     this.#statements = new Map();
+    // JTOpen `holdStatements` → DB2 HOLD_INDICATOR (0x380F). When true,
+    // prepared statements / cursors survive COMMIT so the cache isn't
+    // invalidated on every transaction boundary. `null` leaves the
+    // server on its default behavior (cursor closes at commit).
+    this.defaultHoldIndicator = typeof opts.holdIndicator === 'number'
+      ? opts.holdIndicator : null;
+
+    // Plumbing-only performance knobs. Stored verbatim so a later
+    // pass can wire wire-shape behavior behind them without churn.
+    // Exposed for inspection (test harness, bench, future package
+    // manager). Defaults are nullish — the fast path checks
+    // `if (this.extendedDynamic)` and short-circuits.
+    this.extendedDynamic = opts.extendedDynamic ?? null;
+    this.packageCache = opts.packageCache ?? null;
+    this.packageName = opts.packageName ?? null;
+    this.packageLibrary = opts.packageLibrary ?? null;
+    this.defaultBlockSizeKB = Number.isFinite(opts.blockSizeKB)
+      ? opts.blockSizeKB
+      : null;
+
+    // Lightweight protocol-activity counters. Zero cost when unread.
+    // Exposed via `metrics`; reset via `resetMetrics()`. Used by the
+    // live benchmark to tie performance changes to real protocol
+    // behavior (e.g., did a knob halve the fetch RTT count?). The
+    // package* counters stay 0 until the next pass actually wires
+    // server-side SQL package interactions; surfacing them now means
+    // the bench harness doesn't change shape when that lands.
+    this.metrics = {
+      prepareCalls: 0,        // StatementManager.prepareStatement
+      executeCalls: 0,        // StatementManager.execute (inc. SELECT/DML/CALL)
+      batchCalls: 0,          // StatementManager.executeBatch chunks
+      closeStatementCalls: 0, // StatementManager.closeStatement
+      packageHits: 0,         // statement found in server-side SQL package
+      packageCreates: 0,      // statement added to server-side SQL package
+      packageFetches: 0,      // server-side SQL package round-trip
+    };
+  }
+
+  resetMetrics() {
+    this.metrics.prepareCalls = 0;
+    this.metrics.executeCalls = 0;
+    this.metrics.batchCalls = 0;
+    this.metrics.closeStatementCalls = 0;
+    this.metrics.packageHits = 0;
+    this.metrics.packageCreates = 0;
+    this.metrics.packageFetches = 0;
   }
 
   /**
    * Prepare a SQL statement with describe (get column/param metadata).
+   *
+   * `opts.cursorName` (when non-empty) is sent to the server as the
+   * RPB's cursor name instead of the auto-generated `CRSR<rpbId>`.
+   * Required for positioned `UPDATE / DELETE WHERE CURRENT OF
+   * <name>` so the server can resolve the user-named cursor across
+   * a separate prepared statement.
+   *
    * @param {string} sql
+   * @param {object} [opts]
+   * @param {string} [opts.cursorName] - explicit cursor name from
+   *   `Statement.setCursorName()` / `PreparedStatement.setCursorName()`.
    * @returns {Promise<PreparedStatementHandle>}
    */
-  async prepareStatement(sql) {
+  async prepareStatement(sql, opts = {}) {
+    this.metrics.prepareCalls++;
     const rpbId = nextRpbId();
-    const cursorName = generateCursorName(rpbId);
+    // Honor user-supplied cursor names for positioned UPDATE/DELETE.
+    // When no name is given, fall back to the auto-generated value
+    // so existing behavior (and the prepared-statement cache) is
+    // unaffected on the fast path.
+    const requestedCursor = opts && typeof opts.cursorName === 'string'
+      ? opts.cursorName.trim() : '';
+    const cursorName = requestedCursor.length > 0
+      ? requestedCursor
+      : generateCursorName(rpbId);
     const statementName = generateStatementName(rpbId);
     const statementType = inferStatementType(sql);
+    const openAttributes = getOpenAttributesForSql(sql);
 
-    // Create RPB with cursor name + statement name (per jtopenlite)
+    // Create RPB with cursor name + statement name (per jtopenlite).
+    // Thread the connection-level HOLD_INDICATOR when the user asked
+    // for holdStatements=true, so cursors survive COMMIT without a
+    // reprepare round-trip.
     const createRpbBuf = DBRequestDS.buildCreateRPB({
       rpbId,
       cursorName,
       statementName,
+      identifierCcsid: this.#serverCCSID,
+      openAttributes,
+      holdIndicator: this.defaultHoldIndicator ?? undefined,
     });
     const createReplyBuf = await this.#connection.sendAndReceive(createRpbBuf);
     const createReply = parseOperationReply(createReplyBuf, { serverCCSID: this.#serverCCSID });
@@ -122,9 +280,10 @@ export class StatementManager {
       rpbId,
       sqlText: sql,
       statementName,
+      identifierCcsid: this.#serverCCSID,
       statementType,
       prepareOption: 0,
-      openAttributes: OpenAttributes.READ_ONLY,
+      openAttributes,
       extendedColumnDescriptorOption: 0xF1,
       parameterMarkerFormat: true,
     });
@@ -166,6 +325,7 @@ export class StatementManager {
       sql,
       statementName,
       cursorName,
+      openAttributes,
       columnDescriptors,
       paramDescriptors,
       paramRecordSize,
@@ -196,6 +356,7 @@ export class StatementManager {
    */
   async execute(stmt, params = [], opts = {}) {
     if (stmt.closed) throw new Error('Statement is closed');
+    this.metrics.executeCalls++;
 
     let parameterMarkerData = null;
     let activeParamDescriptors = stmt.paramDescriptors;
@@ -229,16 +390,36 @@ export class StatementManager {
 
     if (isSelect) {
       // SELECT: open cursor via OPEN_AND_DESCRIBE.
-      // Pass BLOCKING_FACTOR so the server returns the first block of rows
-      // inline with the open reply — saves 1 RTT per N rows. JTOpen does the
-      // same by default (block size ~32KB worth of rows).
-      const blockingFactor = opts.blockingFactor ?? 2048;
+      //
+      // js400 intentionally keeps the default read-only SELECT path on the
+      // pure open + later FETCH flow, even for read-only cursors. A live-host
+      // qualification pass against a live IBM i host showed that requesting inline first
+      // block data with OPEN_DESCRIBE_FETCH (0x180E) produced empty or
+      // corrupted singleton/catalog rows on real IBM i queries, while plain
+      // OPEN_AND_DESCRIBE (0x1804) followed by FETCH returned correct data.
+      //
+      // Keep `requestResultData` off until the 0x180E path is fully qualified
+      // against live hosts. This preserves correctness without a measurable
+      // performance loss in the current bench, because the existing benchmark
+      // was already paying the same FETCH round-trips.
+      const isReadOnlyCursor = (stmt.openAttributes ?? OpenAttributes.READ_ONLY)
+        === OpenAttributes.READ_ONLY;
+      const blockingFactor = isReadOnlyCursor
+        ? (
+            opts.blockingFactor
+            ?? this.#computeBlockSizeRows(stmt.columnDescriptors, stmt.openAttributes)
+            ?? 2048
+          )
+        : 1;
+      const requestResultData = false;
       const reqBuf = DBRequestDS.buildOpenAndDescribe({
         rpbId: stmt.rpbId,
         parameterMarkerData,
         pmDescriptorHandle: stmt.descriptorHandle ?? 0,
-        openAttributes: 0x80,
+        identifierCcsid: this.#serverCCSID,
+        openAttributes: stmt.openAttributes ?? OpenAttributes.READ_ONLY,
         blockingFactor,
+        requestResultData,
       });
 
       const replyBuf = await this.#connection.sendAndReceive(reqBuf);
@@ -249,13 +430,39 @@ export class StatementManager {
         throwIfError(reply.sqlca, 'Open cursor');
       }
 
-      // Register cursor for subsequent fetches
-      this.#cursorManager.registerCursor(stmt.rpbId, stmt.columnDescriptors);
+      // Prefer the open reply's row format over the stale PREPARE descriptors.
+      // Even on the pure-open path the host can refine the row format at open
+      // time (for example, metadata queries may widen names / labels), so the
+      // cursor must fetch with the open-time descriptors, not the PREPARE-time
+      // guess.
+      let openColumnDescriptors = stmt.columnDescriptors;
+      const basicFormats = reply.codePoints.get(0x3805) || [];
+      const extFormats = reply.codePoints.get(0x3812) || [];
+      if (extFormats.length > 0) {
+        try {
+          openColumnDescriptors = parseSuperExtendedDataFormat(extFormats[0]).descriptors;
+        } catch {
+          openColumnDescriptors = stmt.columnDescriptors;
+        }
+      } else if (basicFormats.length > 0) {
+        try {
+          openColumnDescriptors = parseBasicDataFormat(basicFormats[0]).descriptors;
+        } catch {
+          openColumnDescriptors = stmt.columnDescriptors;
+        }
+      }
+      stmt.columnDescriptors = openColumnDescriptors;
 
-      // Decode any initial rows from 0x380E result data
+      // Register cursor for subsequent fetches
+      this.#cursorManager.registerCursor(stmt.rpbId, openColumnDescriptors);
+
+      // No inline rows are requested on the default path above, so `rows`
+      // stays empty and the first `ResultSet.next()` / `toArray()` call will
+      // issue FETCH. The loop is kept so a future re-qualified prefetch path
+      // can reuse the same decode logic.
       const rows = [];
       for (const dataBuf of reply.rowDataBuffers) {
-        const decoded = decodeResultData(dataBuf, stmt.columnDescriptors, this.#serverCCSID);
+        const decoded = decodeResultData(dataBuf, openColumnDescriptors, this.#serverCCSID);
         rows.push(...decoded);
       }
 
@@ -266,19 +473,126 @@ export class StatementManager {
         sqlca: reply.sqlca,
         rpbId: stmt.rpbId,
         endOfData: reply.endOfData,
-        columnDescriptors: stmt.columnDescriptors,
+        columnDescriptors: openColumnDescriptors,
+        defaultFetchRows: this.#computeBlockSizeRows(
+          openColumnDescriptors,
+          stmt.openAttributes,
+        ),
         blockingFactor,
       };
     }
 
-    // DML: use EXECUTE
+    // DML or CALL: use EXECUTE.
+    //
+    // For CALL statements with parameter markers, request the parameter
+    // row in the reply (ORS RESULT_DATA) and decode OUT/INOUT values from
+    // code point 0x380E using the parameter descriptors. This mirrors
+    // JTOpen AS400JDBCCallableStatement which reads `reply.getResultData()`
+    // into `parameterRow_` and exposes OUT values through the standard
+    // getters. SELECT / DML paths remain unchanged — the extra bit and
+    // decode cost only applies to CALL.
+    const isCall = inferStatementType(stmt.sql) === StatementType.CALL;
+    const requestOutputData = isCall && activeParamDescriptors.length > 0;
+
     const reqBuf = DBRequestDS.buildExecute({
       rpbId: stmt.rpbId,
       parameterMarkerData,
       pmDescriptorHandle: stmt.descriptorHandle ?? 0,
+      requestOutputData,
     });
 
     const replyBuf = await this.#connection.sendAndReceive(reqBuf);
+
+    if (requestOutputData) {
+      const reply = parseFetchReply(replyBuf, { serverCCSID: this.#serverCCSID });
+      if (reply.sqlca.isError && reply.sqlca.sqlCode !== 100) {
+        throwIfError(reply.sqlca, 'Execute CALL');
+      }
+      let parameterRow = null;
+      if (reply.rowDataBuffers.length > 0) {
+        const decoded = decodeResultData(
+          reply.rowDataBuffers[0], activeParamDescriptors, this.#serverCCSID,
+        );
+        if (decoded.length > 0) parameterRow = decoded[0];
+      }
+
+      // Secondary 0x380E blocks in a CALL reply are the rows of
+      // additional result sets the procedure opened (DECLARE CURSOR
+      // + OPEN). The server typically inlines a descriptor (0x3805
+      // or 0x3812) per result set alongside the data block. We pair
+      // each tail buffer with the i-th available descriptor to
+      // surface ONE GROUP PER RESULT SET instead of merging them
+      // into a single flat list. When no descriptor is available
+      // for a tail buffer, we preserve it as raw bytes so a higher
+      // layer that knows the shape out-of-band can still decode it.
+      //
+      // `resultSetGroups` is the new authoritative shape;
+      // `resultSetRows` / `resultSetDescriptors` / `extraResultBuffers`
+      // remain populated from the *first* group for backward
+      // compatibility with callers that haven't moved over.
+      const resultSetGroups = [];
+      let resultSetRows = null;
+      let resultSetDescriptors = null;
+      let extraResultBuffers = null;
+      if (reply.rowDataBuffers.length > 1) {
+        const tail = reply.rowDataBuffers.slice(1);
+        const basicFormats = reply.codePoints.get(0x3805) || [];
+        const superExtFormats = reply.codePoints.get(0x3812) || [];
+
+        // Pre-parse all descriptors once so each tail buffer's
+        // pairing is O(1).
+        const decodedFormats = [];
+        for (const buf of basicFormats) {
+          if (buf && buf.length >= 8) {
+            decodedFormats.push(parseBasicDataFormat(buf).descriptors);
+          }
+        }
+        for (const buf of superExtFormats) {
+          if (buf && buf.length >= 16) {
+            decodedFormats.push(parseSuperExtendedDataFormat(buf).descriptors);
+          }
+        }
+
+        const tailExtras = [];
+        for (let i = 0; i < tail.length; i++) {
+          const buf = tail[i];
+          // Prefer an i-aligned descriptor; fall back to the first
+          // one when the server sent fewer descriptors than blocks
+          // (best effort — better than losing rows).
+          let descriptors = decodedFormats[i] || decodedFormats[0] || null;
+          if (descriptors && descriptors.length > 0) {
+            const rows = decodeResultData(buf, descriptors, this.#serverCCSID);
+            resultSetGroups.push({ rows, descriptors });
+          } else {
+            tailExtras.push(buf);
+            resultSetGroups.push({ __raw: buf });
+          }
+        }
+        // Backward-compat surface from the first group.
+        const first = resultSetGroups[0];
+        if (first?.rows) {
+          resultSetRows = first.rows;
+          resultSetDescriptors = first.descriptors;
+        }
+        if (tailExtras.length > 0) extraResultBuffers = tailExtras;
+      }
+      return {
+        hasResultSet: false,
+        rows: [],
+        affectedRows: reply.sqlca.rowCount,
+        sqlca: reply.sqlca,
+        rpbId: stmt.rpbId,
+        endOfData: true,
+        columnDescriptors: [],
+        parameterRow,
+        parameterDescriptors: activeParamDescriptors,
+        resultSetGroups,
+        resultSetRows,
+        resultSetDescriptors,
+        extraResultBuffers,
+      };
+    }
+
     const reply = parseOperationReply(replyBuf, { serverCCSID: this.#serverCCSID });
     throwIfError(reply.sqlca, 'Execute');
 
@@ -312,6 +626,7 @@ export class StatementManager {
    */
   async executeBatch(stmt, paramSets) {
     if (stmt.closed) throw new Error('Statement is closed');
+    this.metrics.batchCalls++;
 
     const batchSize = paramSets?.length ?? 0;
     if (batchSize === 0) {
@@ -522,6 +837,7 @@ export class StatementManager {
    */
   async closeStatement(stmt) {
     if (stmt.closed) return;
+    this.metrics.closeStatementCalls++;
 
     try {
       await this.#cursorManager.closeCursor(stmt.rpbId);
@@ -871,6 +1187,24 @@ export class StatementManager {
       }
       encodeValueInto(v, buf, offset, fieldLen, desc, serverCcsid);
     };
+  }
+
+  #computeBlockSizeRows(descriptors, openAttributes) {
+    if (this.defaultBlockSizeKB == null) return null;
+    if ((openAttributes ?? OpenAttributes.READ_ONLY) !== OpenAttributes.READ_ONLY) {
+      return 1;
+    }
+
+    let rowLength = 0;
+    for (const desc of descriptors || []) {
+      rowLength += getColumnByteLength(desc);
+    }
+    if (rowLength <= 0) return 1;
+
+    let rows = Math.floor((this.defaultBlockSizeKB * 1024) / rowLength);
+    if (rows > 32767) rows = 32767;
+    if (rows <= 1) rows = 1;
+    return rows;
   }
 
   #encodeParameters(params, descriptors, encodedValues = []) {

@@ -21,6 +21,18 @@ export class CursorManager {
     this.#connection = connection;
     this.#serverCCSID = opts.serverCCSID ?? 37;
     this.#cursors = new Map();
+    // Lightweight protocol-activity counters. Read via `metrics`;
+    // reset via `resetMetrics()`. Zero cost when unread — a handful
+    // of integer increments on the hot path.
+    this.metrics = {
+      fetchCalls: 0,       // CursorManager.fetch RTTs
+      closeCursorCalls: 0, // CursorManager.closeCursor RTTs
+    };
+  }
+
+  resetMetrics() {
+    this.metrics.fetchCalls = 0;
+    this.metrics.closeCursorCalls = 0;
   }
 
   registerCursor(rpbId, descriptors) {
@@ -44,6 +56,7 @@ export class CursorManager {
     }
     if (cursor.endOfData) return [];
 
+    this.metrics.fetchCalls++;
     const reqBuf = DBRequestDS.buildFetch({ rpbId, fetchCount: count });
     const replyBuf = await this.#connection.sendAndReceive(reqBuf);
     const reply = parseFetchReply(replyBuf, { serverCCSID: this.#serverCCSID });
@@ -85,6 +98,7 @@ export class CursorManager {
     const cursor = this.#cursors.get(rpbId);
     if (!cursor || !cursor.open) return;
 
+    this.metrics.closeCursorCalls++;
     const reqBuf = DBRequestDS.buildCloseCursor({ rpbId });
     const replyBuf = await this.#connection.sendAndReceive(reqBuf);
     const reply = parseFetchReply(replyBuf, { serverCCSID: this.#serverCCSID });

@@ -1048,8 +1048,14 @@ export class DatabaseMetaData {
   supportsMinimumSQLGrammar()           { return true; }
   supportsMixedCaseIdentifiers()        { return false; }
   supportsMixedCaseQuotedIdentifiers()  { return true; }
-  supportsMultipleOpenResults()         { return true; }
-  supportsMultipleResultSets()          { return true; }
+  // Multi-result-set machinery exists on the Statement API (the
+  // #pendingResults queue, getMoreResults()), but no engine/protocol
+  // path populates additional result sets from a CALL reply today, so
+  // JDBC callers that probe these capabilities will otherwise get
+  // false positives. Report false until the engine actually drains
+  // server-side extra result sets — then flip these back to true.
+  supportsMultipleOpenResults()         { return false; }
+  supportsMultipleResultSets()          { return false; }
   supportsMultipleTransactions()        { return true; }
   supportsNamedParameters()            { return true; }
   supportsNonNullableColumns()          { return true; }
@@ -1060,10 +1066,29 @@ export class DatabaseMetaData {
   supportsOpenStatementsAcrossRollback() { return false; }
   supportsOrderByUnrelated()           { return true; }
   supportsOuterJoins()                 { return true; }
+  // Positioned delete/update are live-qualified on IBM i:
+  // `Statement.setCursorName()` now reaches CREATE_RPB's CURSOR_NAME
+  // code point using the server CCSID (matching JTOpen's converter
+  // path), and `UPDATE/DELETE ... WHERE CURRENT OF <cursor>` succeeds
+  // end-to-end on a live IBM i host against a real open cursor.
   supportsPositionedDelete()           { return true; }
   supportsPositionedUpdate()           { return true; }
-  supportsResultSetConcurrency(conc, type) { return true; }
-  supportsResultSetType(type)          { return true; }
+  supportsResultSetConcurrency(conc, type) {
+    // Only CONCUR_READ_ONLY is honored today; no updatable result-set
+    // machinery exists. Accept any type that is itself supported.
+    if (conc !== 1007) return false; // not CONCUR_READ_ONLY
+    return this.supportsResultSetType(type);
+  }
+  supportsResultSetType(type) {
+    // FORWARD_ONLY is the native host cursor shape.
+    // SCROLL_INSENSITIVE is honored via in-memory row buffering.
+    // SCROLL_SENSITIVE requires server-side sensitive scroll, which is
+    // not wired — report false so JDBC-aware callers don't assume live
+    // re-read semantics they will not get.
+    if (type === 1003 /* FORWARD_ONLY */) return true;
+    if (type === 1004 /* SCROLL_INSENSITIVE */) return true;
+    return false;
+  }
   supportsSavepoints()                  { return true; }
   supportsSchemasInDataManipulation()   { return true; }
   supportsSchemasInIndexDefinitions()   { return true; }

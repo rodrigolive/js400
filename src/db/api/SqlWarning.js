@@ -62,3 +62,35 @@ export class SqlWarning {
     return `SQLWarning: ${this.#sqlState} ${this.#message}`;
   }
 }
+
+/**
+ * Build a SqlWarning from a parsed SQLCA reply fragment. Returns
+ * `null` when the SQLCA does NOT carry a warning, so the caller can
+ * inline this on the fast path without branching:
+ *
+ *   const w = warningFromSqlca(result.sqlca);
+ *   if (w) this.#appendWarning(w);
+ *
+ * A warning is any `sqlCode > 0` other than 100 (end-of-data, not a
+ * warning), or any non-zero byte in the 11-byte sqlwarn array.
+ *
+ * @param {object|null|undefined} sqlca
+ * @returns {SqlWarning|null}
+ */
+export function warningFromSqlca(sqlca) {
+  if (!sqlca) return null;
+  const code = sqlca.sqlCode | 0;
+  const isCodeWarning = code > 0 && code !== 100;
+  let anyBit = false;
+  if (!isCodeWarning && Array.isArray(sqlca.sqlwarn)) {
+    for (let i = 0; i < sqlca.sqlwarn.length; i++) {
+      if (sqlca.sqlwarn[i]) { anyBit = true; break; }
+    }
+  }
+  if (!isCodeWarning && !anyBit) return null;
+  const msg = sqlca.messageTokens || `SQLCODE ${code}`;
+  return new SqlWarning(msg, {
+    sqlState: sqlca.sqlState || '01000',
+    vendorCode: code,
+  });
+}

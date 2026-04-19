@@ -10,7 +10,17 @@
  */
 
 import { ResultSet, ResultSetType, ResultSetConcurrency, ResultSetHoldability } from './ResultSet.js';
-import { SqlWarning } from './SqlWarning.js';
+import { SqlWarning, warningFromSqlca } from './SqlWarning.js';
+import { SqlError } from '../../core/errors.js';
+
+/**
+ * Default *row count* for cursor FETCH requests when the caller did not
+ * call `setFetchSize()`. The engine's OPEN blocking factor is in bytes;
+ * the FETCH BLOCKING_FACTOR is a row count, so the two cannot share a
+ * default — feeding the byte-level open default in here would silently
+ * blow up the per-fetch row count on large scans.
+ */
+const DEFAULT_FETCH_ROWS = 2048;
 
 /** JDBC Statement.SUCCESS_NO_INFO sentinel used in executeBatch updateCounts. */
 export const SUCCESS_NO_INFO = -2;
@@ -104,9 +114,14 @@ export class Statement {
     this.#ensureOpen();
     this.#resetStateForExecute();
 
-    const stmtHandle = await this.#dbConnection.prepareStatement(sql);
+    const stmtHandle = await this.#dbConnection.prepareStatement(
+      sql, this.#prepareOpts(),
+    );
     try {
-      const result = await this.#dbConnection.statementManager.execute(stmtHandle);
+      const result = await this.#runWithCancellation(
+        () => this.#dbConnection.statementManager.execute(stmtHandle),
+      );
+      this.#propagateSqlcaWarning(result.sqlca);
 
       if (result.hasResultSet) {
         const rs = new ResultSet({
@@ -115,7 +130,7 @@ export class Statement {
           cursorManager: this.#dbConnection.cursorManager,
           rpbId: result.rpbId,
           endOfData: result.endOfData,
-          fetchSize: this.#fetchSize || result.blockingFactor || 2048,
+          fetchSize: this.#fetchSize || result.defaultFetchRows || DEFAULT_FETCH_ROWS,
           type: this.#type,
           concurrency: this.#concurrency,
           holdability: this.#holdability,
@@ -154,9 +169,16 @@ export class Statement {
 
     if (wantsKeys && isInsertSql(sql)) {
       const wrapped = `SELECT * FROM FINAL TABLE (${sql})`;
+      // No cursor-name flow for the FINAL TABLE wrap — it opens a
+      // synthetic cursor for the generated keys, not the user's
+      // statement cursor. Default auto-generated name keeps the
+      // engine fast path.
       const stmtHandle = await this.#dbConnection.prepareStatement(wrapped);
       try {
-        const result = await this.#dbConnection.statementManager.execute(stmtHandle);
+        const result = await this.#runWithCancellation(
+          () => this.#dbConnection.statementManager.execute(stmtHandle),
+        );
+        this.#propagateSqlcaWarning(result.sqlca);
         const rows = result.hasResultSet ? result.rows : [];
         this.#lastGeneratedKeys = {
           rows: [...rows],
@@ -169,7 +191,10 @@ export class Statement {
       }
     }
 
-    const result = await this.#dbConnection.executeImmediate(sql);
+    const result = await this.#runWithCancellation(
+      () => this.#dbConnection.executeImmediate(sql),
+    );
+    this.#propagateSqlcaWarning(result.sqlca);
     this.#lastUpdateCount = result.affectedRows ?? 0;
     return { affectedRows: result.affectedRows };
   }
@@ -189,17 +214,22 @@ export class Statement {
     // before we prepare a new one.
     await this.#closeActiveHandle();
 
-    const stmtHandle = await this.#dbConnection.prepareStatement(sql);
+    const stmtHandle = await this.#dbConnection.prepareStatement(
+      sql, this.#prepareOpts(),
+    );
     this.#activeHandle = stmtHandle;
     this.#activeHandleClosed = false;
 
     let result;
     try {
-      result = await this.#dbConnection.statementManager.execute(stmtHandle);
+      result = await this.#runWithCancellation(
+        () => this.#dbConnection.statementManager.execute(stmtHandle),
+      );
     } catch (err) {
       await this.#closeActiveHandle();
       throw err;
     }
+    this.#propagateSqlcaWarning(result.sqlca);
 
     if (!result.hasResultSet) {
       await this.#closeActiveHandle();
@@ -212,7 +242,7 @@ export class Statement {
       cursorManager: this.#dbConnection.cursorManager,
       rpbId: result.rpbId,
       endOfData: result.endOfData,
-      fetchSize: this.#fetchSize || result.blockingFactor || 2048,
+      fetchSize: this.#fetchSize || result.defaultFetchRows || DEFAULT_FETCH_ROWS,
       type: this.#type,
       concurrency: this.#concurrency,
       holdability: this.#holdability,
@@ -256,12 +286,21 @@ export class Statement {
    */
   async executeBatch() {
     this.#ensureOpen();
+    // JTOpen parity: clear the warning chain before running a batch
+    // so per-element SQLCA warnings reflect only this batch.
+    this.#warnings = null;
     const batch = this.#batch;
     this.#batch = [];
     const counts = new Array(batch.length);
     for (let i = 0; i < batch.length; i++) {
       try {
-        const r = await this.#dbConnection.executeImmediate(batch[i]);
+        const r = await this.#runWithCancellation(
+          () => this.#dbConnection.executeImmediate(batch[i]),
+        );
+        // A successful element can still carry SQLCA warning bits
+        // (e.g. +1 string truncation on UPDATE). Fold those into the
+        // batch-level chain so callers see them after the loop.
+        this.#propagateSqlcaWarning(r.sqlca);
         counts[i] = r.affectedRows ?? SUCCESS_NO_INFO;
       } catch (err) {
         counts[i] = EXECUTE_FAILED;
@@ -346,6 +385,15 @@ export class Statement {
   getMaxRows()         { return this.#maxRows; }
   setMaxFieldSize(n)   { this.#maxFieldSize = Math.max(0, n | 0); }
   getMaxFieldSize()    { return this.#maxFieldSize; }
+  // queryTimeout is honored by `#runWithCancellation()`: positive
+  // values arm a per-execute `setTimeout(n*1000)` that flips
+  // `#cancelled`; the wrapper throws `SqlError(HY008)` after the
+  // in-flight RTT returns. The fast path (n = 0) takes a single
+  // boolean check and does not allocate. No server-side RPB timeout
+  // is sent and no mid-RTT preemption is performed — that needs a
+  // side connection (JTOpen `AS400JDBCConnectionImpl.cancel`) and is
+  // explicitly tracked as the remaining gap in
+  // docs/sql-feature-matrix.md and .agent/DB2-GAP-VERIFY.md.
   setQueryTimeout(n)   { this.#queryTimeout = Math.max(0, n | 0); }
   getQueryTimeout()    { return this.#queryTimeout; }
   setEscapeProcessing(v){ this.#escapeProcessing = Boolean(v); }
@@ -359,10 +407,67 @@ export class Statement {
   getResultSetConcurrency() { return this.#concurrency; }
   getResultSetHoldability() { return this.#holdability; }
 
-  /** Mark statement as cancelled. No-op on the server side for now. */
+  /**
+   * Mark the statement as cancelled. The next operation will throw
+   * `SqlError(HY008)`. Client-side only — js400 does not yet send a
+   * protocol-level cancel (JTOpen sends `FUNCTIONID_CANCEL` 0x1818
+   * via `connection_.cancel(id_)`); a real wire cancel needs a side
+   * connection. Calling `cancel()` while no execute is in flight
+   * still affects the next execute.
+   */
   cancel() { this.#cancelled = true; }
   /** @returns {boolean} */
   isCancelled() { return this.#cancelled; }
+
+  /**
+   * Cancel-and-timeout wrapper. Mirrors the helper in
+   * `PreparedStatement` (see that file for the design rationale).
+   *
+   *   - `queryTimeout = 0` and not cancelled → fast path: 1 boolean
+   *     check + the wrapped invocation. No timer. No allocation.
+   *   - cancelled before invocation → throw HY008 immediately, clear.
+   *   - `queryTimeout > 0` → arm a `setTimeout` that flips
+   *     `#cancelled`; the engine call still runs to completion (no
+   *     side channel to inject `FUNCTIONID_CANCEL` mid-RTT) but the
+   *     post-check throws HY008 so the next caller sees the timeout.
+   *
+   * @template T
+   * @param {() => Promise<T>} invoke
+   * @returns {Promise<T>}
+   */
+  async #runWithCancellation(invoke) {
+    if (this.#cancelled) {
+      this.#cancelled = false;
+      throw new SqlError('Statement was cancelled', {
+        messageId: 'HY008', returnCode: -952,
+      });
+    }
+    if (this.#queryTimeout <= 0) {
+      return invoke();
+    }
+    let timer = null;
+    let invokeError = null;
+    let result;
+    try {
+      timer = setTimeout(
+        () => { this.#cancelled = true; },
+        this.#queryTimeout * 1000,
+      );
+      result = await invoke();
+    } catch (e) {
+      invokeError = e;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (this.#cancelled) {
+      this.#cancelled = false;
+      throw new SqlError('Query timeout exceeded', {
+        messageId: 'HY008', returnCode: -952,
+      });
+    }
+    if (invokeError) throw invokeError;
+    return result;
+  }
 
   /** @returns {SqlWarning|null} */
   getWarnings() { return this.#warnings; }
@@ -371,6 +476,12 @@ export class Statement {
     const w = msg instanceof SqlWarning ? msg : new SqlWarning(msg, opts);
     if (!this.#warnings) this.#warnings = w;
     else this.#warnings.setNextWarning(w);
+  }
+
+  /** Fold SQLCA warning bits from a reply into the statement chain. */
+  #propagateSqlcaWarning(sqlca) {
+    const w = warningFromSqlca(sqlca);
+    if (w) this.addWarning(w);
   }
 
   /**
@@ -404,10 +515,29 @@ export class Statement {
     await this.#closeActiveHandle();
   }
 
+  /**
+   * Build the per-prepare options bag passed to
+   * `dbConnection.prepareStatement()`. Returns `undefined` (NOT an
+   * empty object) when no cursor name is set, so the engine sees
+   * the same call shape as before for the common case — no extra
+   * allocation on the hot path. Only positioned-UPDATE/DELETE
+   * callers (who set a cursor name) pay any cost.
+   */
+  #prepareOpts() {
+    if (this.#cursorName && this.#cursorName.length > 0) {
+      return { cursorName: this.#cursorName };
+    }
+    return undefined;
+  }
+
   #resetStateForExecute() {
     this.#lastResultSet = null;
     this.#lastUpdateCount = -1;
     this.#lastGeneratedKeys = null;
+    // JDBC/JTOpen parity (AS400JDBCStatement.commonExecuteBefore at
+    // line ~1398): clear the warning chain at the start of every
+    // execute so `getWarnings()` reflects only THIS call.
+    this.#warnings = null;
   }
 
   /**

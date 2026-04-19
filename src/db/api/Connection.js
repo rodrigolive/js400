@@ -17,7 +17,7 @@ import { PreparedStatementCache } from './PreparedStatementCache.js';
 import { DatabaseMetaData } from './DatabaseMetaData.js';
 import { ResultSetHoldability } from './ResultSet.js';
 import { SqlArray } from './SqlArray.js';
-import { SqlWarning } from './SqlWarning.js';
+import { SqlWarning, warningFromSqlca } from './SqlWarning.js';
 import { Blob } from '../lob/Blob.js';
 import { Clob } from '../lob/Clob.js';
 import { SQLXML } from '../lob/SQLXML.js';
@@ -143,6 +143,15 @@ export class Connection {
       const stmt = await this.prepare(sql);
       try {
         const result = await stmt.execute(params ?? [], opts);
+        // Drain the inner prepared statement's warnings onto the
+        // connection chain before its handle is released. Without
+        // this graft the reply's SQLCA warnings would be lost when
+        // the statement returns to the cache.
+        const stmtWarnings = stmt.getWarnings?.();
+        if (stmtWarnings) {
+          if (!this.#warnings) this.#warnings = stmtWarnings;
+          else this.#warnings.setNextWarning(stmtWarnings);
+        }
         if (Array.isArray(result)) {
           return { affectedRows: result.length };
         }
@@ -152,7 +161,8 @@ export class Connection {
       }
     }
 
-    return this.#dbConnection.executeImmediate(sql);
+    const result = await this.#executeImmediateWithWarning(sql);
+    return result;
   }
 
   /**
@@ -176,11 +186,20 @@ export class Connection {
    * @param {string} sql
    * @param {object} [opts]
    * @param {boolean} [opts.cache=true] - set false to bypass the cache
+   * @param {string} [opts.cursorName] - explicit cursor name for
+   *   positioned UPDATE/DELETE. When set, the cache is bypassed for
+   *   this prepare (a named cursor pinned to a specific server-side
+   *   RPB shouldn't be silently shared across callers).
    * @returns {Promise<PreparedStatement>}
    */
   async prepare(sql, opts = {}) {
     this.#ensureOpen();
-    const useCache = this.#stmtCacheCap > 0 && opts.cache !== false;
+    const explicitCursor = typeof opts.cursorName === 'string'
+      && opts.cursorName.length > 0;
+    // A named cursor is statement-specific identity; never serve it
+    // from the cache (could leak the wrong cursor name to a peer
+    // caller that prepared the same SQL).
+    const useCache = this.#stmtCacheCap > 0 && opts.cache !== false && !explicitCursor;
     let handle = null;
     let cached = false;
 
@@ -193,7 +212,10 @@ export class Connection {
       cached = Boolean(handle);
     }
     if (!handle) {
-      handle = await this.#dbConnection.prepareStatement(sql);
+      handle = await this.#dbConnection.prepareStatement(
+        sql,
+        explicitCursor ? { cursorName: opts.cursorName } : undefined,
+      );
     }
 
     // Hand the PreparedStatement a release-back-to-cache hook. If
@@ -300,7 +322,7 @@ export class Connection {
   /** Commit the current transaction. */
   async commit() {
     this.#ensureOpen();
-    await this.#dbConnection.commit();
+    this.#propagateSqlcaWarning(await this.#dbConnection.commit());
   }
 
   /**
@@ -310,9 +332,11 @@ export class Connection {
   async rollback(savepoint) {
     this.#ensureOpen();
     if (savepoint) {
-      await this.#dbConnection.rollbackToSavepoint(savepoint);
+      this.#propagateResultWarning(
+        await this.#dbConnection.rollbackToSavepoint(savepoint),
+      );
     } else {
-      await this.#dbConnection.rollback();
+      this.#propagateSqlcaWarning(await this.#dbConnection.rollback());
     }
   }
 
@@ -323,7 +347,9 @@ export class Connection {
    */
   async savepoint(name) {
     this.#ensureOpen();
-    return this.#dbConnection.setSavepoint(name);
+    const result = await this.#dbConnection.setSavepoint(name);
+    this.#propagateResultWarning(result);
+    return result?.savepoint ?? result;
   }
 
   /** Alias for savepoint() with JDBC naming. */
@@ -335,7 +361,9 @@ export class Connection {
    */
   async releaseSavepoint(savepoint) {
     this.#ensureOpen();
-    await this.#dbConnection.releaseSavepoint(savepoint);
+    this.#propagateResultWarning(
+      await this.#dbConnection.releaseSavepoint(savepoint),
+    );
   }
 
   /** @param {boolean} value */
@@ -367,9 +395,11 @@ export class Connection {
     this.#isolation = name;
     const sqlTag = ISO_NAME_TO_SQL[name];
     if (name === IsolationLevel.NONE) {
-      await this.#dbConnection.executeImmediate('SET CURRENT ISOLATION = NC');
+      await this.#executeImmediateWithWarning('SET CURRENT ISOLATION = NC');
     } else if (sqlTag) {
-      await this.#dbConnection.executeImmediate(`SET CURRENT ISOLATION = ${sqlTag}`);
+      await this.#executeImmediateWithWarning(
+        `SET CURRENT ISOLATION = ${sqlTag}`,
+      );
     }
   }
 
@@ -392,7 +422,7 @@ export class Connection {
     if (!this.getAutoCommit()) {
       const mode = this.#readOnly ? 'READ ONLY' : 'READ WRITE';
       try {
-        await this.#dbConnection.executeImmediate(`SET TRANSACTION ${mode}`);
+        await this.#executeImmediateWithWarning(`SET TRANSACTION ${mode}`);
       } catch (e) {
         this.addWarning(`Could not apply read-only mode: ${e.message}`);
       }
@@ -437,14 +467,14 @@ export class Connection {
     const sqlKey = CLIENT_INFO_KEYS[key];
     if (sqlKey) {
       try {
-        await this.#dbConnection.executeImmediate(
+        await this.#executeImmediateWithWarning(
           `CALL SYSPROC.WLM_SET_CLIENT_INFO(?,?,?,?,?)`,
         );
       } catch {
         // Not available on all IBM i releases — best-effort. We fall back
         // to SET CURRENT CLIENT_* which is always supported.
         try {
-          await this.#dbConnection.executeImmediate(
+          await this.#executeImmediateWithWarning(
             `SET CURRENT ${sqlKey} = '${val.replace(/'/g, "''")}'`,
           );
         } catch (e) {
@@ -476,7 +506,9 @@ export class Connection {
     const name = String(schema || '').trim();
     this.#schema = name;
     if (name) {
-      await this.#dbConnection.executeImmediate(`SET SCHEMA "${name.replace(/"/g, '""')}"`);
+      await this.#executeImmediateWithWarning(
+        `SET SCHEMA "${name.replace(/"/g, '""')}"`,
+      );
       const libraryList = this.#dbConnection.libraryList;
       if (libraryList) libraryList.defaultSchema = name;
     }
@@ -596,6 +628,49 @@ export class Connection {
     const w = msg instanceof SqlWarning ? msg : new SqlWarning(msg, opts);
     if (!this.#warnings) this.#warnings = w;
     else this.#warnings.setNextWarning(w);
+  }
+
+  /**
+   * Fold a reply-side SQLCA's warning bits into the connection chain.
+   * Fast-path safe: short-circuits to a no-op when the SQLCA is clean
+   * (no allocation, no chain traversal). Used by the public
+   * `execute()` / `commit()` / `rollback()` paths so callers see
+   * server-side warnings even when they bypass `Statement` /
+   * `PreparedStatement`.
+   *
+   * Per JDBC, Connection warnings are *cumulative* — they are not
+   * cleared per-operation. Callers reset via `clearWarnings()`.
+   */
+  #propagateSqlcaWarning(sqlca) {
+    const w = warningFromSqlca(sqlca);
+    if (w) this.addWarning(w);
+  }
+
+  /**
+   * Fold warning-bearing SQLCA out of either a plain SQLCA object or a
+   * wrapper result object like `{ sqlca, affectedRows }`.
+   * @param {object|null|undefined} result
+   */
+  #propagateResultWarning(result) {
+    if (!result || typeof result !== 'object') return;
+    if (result.sqlca) {
+      this.#propagateSqlcaWarning(result.sqlca);
+      return;
+    }
+    if ('sqlCode' in result || 'sqlState' in result || 'sqlwarn' in result) {
+      this.#propagateSqlcaWarning(result);
+    }
+  }
+
+  /**
+   * Execute a connection-level control statement and fold reply-side
+   * warnings into the JDBC-style cumulative Connection chain.
+   * @param {string} sql
+   */
+  async #executeImmediateWithWarning(sql) {
+    const result = await this.#dbConnection.executeImmediate(sql);
+    this.#propagateResultWarning(result);
+    return result;
   }
 
   // --- Pool integration ---

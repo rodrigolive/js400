@@ -10,7 +10,7 @@ import { ResultSet, FetchDirection, ResultSetType, ResultSetConcurrency, ResultS
 import { ResultSetMetaData, JdbcType, ColumnNullable } from '../../src/db/api/ResultSetMetaData.js';
 import { ParameterMetaData, ParameterMode, ParameterNullable } from '../../src/db/api/ParameterMetaData.js';
 import { PreparedStatement, SQL_NULL } from '../../src/db/api/PreparedStatement.js';
-import { CallableStatement } from '../../src/db/api/CallableStatement.js';
+import { CallableStatement, parseCallText } from '../../src/db/api/CallableStatement.js';
 import { SqlWarning } from '../../src/db/api/SqlWarning.js';
 import { PreparedStatementCache } from '../../src/db/api/PreparedStatementCache.js';
 import {
@@ -425,6 +425,146 @@ describe('CallableStatement', () => {
     cstmt.setOutValue(1, null);
     expect(cstmt.getString(1)).toBeNull();
     expect(cstmt.wasNull()).toBe(true);
+  });
+});
+
+describe('CallableStatement call-text parsing', () => {
+  test('parseCallText: bare procedure name', () => {
+    const r = parseCallText('MYLIB.PROC');
+    expect(r.procedureName).toBe('MYLIB.PROC');
+    expect(r.paramCount).toBe(0);
+    expect(r.hasReturn).toBe(false);
+  });
+
+  test('parseCallText: bare CALL with markers', () => {
+    const r = parseCallText('CALL MYLIB.PROC(?, ?)');
+    expect(r.procedureName).toBe('MYLIB.PROC');
+    expect(r.paramCount).toBe(2);
+    expect(r.hasReturn).toBe(false);
+  });
+
+  test('parseCallText: JDBC escape, procedure', () => {
+    const r = parseCallText('{ call MYLIB.PROC(?, ?, ?) }');
+    expect(r.procedureName).toBe('MYLIB.PROC');
+    expect(r.paramCount).toBe(3);
+    expect(r.hasReturn).toBe(false);
+  });
+
+  test('parseCallText: JDBC escape, function with return', () => {
+    const r = parseCallText('{ ? = call MYLIB.FUNC(?, ?) }');
+    expect(r.procedureName).toBe('MYLIB.FUNC');
+    expect(r.paramCount).toBe(2);
+    expect(r.hasReturn).toBe(true);
+  });
+
+  test('parseCallText: ignores ? inside string literals', () => {
+    const r = parseCallText("CALL MYLIB.PROC(?, 'abc?def', ?)");
+    expect(r.paramCount).toBe(2);
+  });
+
+  test('parseCallText: returns null for empty input', () => {
+    expect(parseCallText('')).toBeNull();
+    expect(parseCallText(null)).toBeNull();
+    expect(parseCallText(undefined)).toBeNull();
+  });
+
+  test('CallableStatement constructor reserves slot 1 for function return', () => {
+    const conn = { async prepare() { return { async execute() { return []; }, async close() {} }; } };
+    const cstmt = new CallableStatement(conn, '{ ? = call MYLIB.FUNC(?, ?) }');
+    expect(cstmt.procedureName).toBe('MYLIB.FUNC');
+    expect(cstmt.hasReturn).toBe(true);
+    // Slot 1 is the return; user can register its OUT type.
+    cstmt.registerOutParameter(1, 'integer');
+    cstmt.setObject(2, 'foo');
+    cstmt.setObject(3, 42);
+    expect(cstmt.parameterCount).toBe(4); // index 0 hole + 3 slots
+  });
+
+  test('CallableStatement constructor accepts bare CALL form', () => {
+    const conn = { async prepare() { return { async execute() { return []; }, async close() {} }; } };
+    const cstmt = new CallableStatement(conn, 'CALL MYLIB.PROC(?, ?)');
+    expect(cstmt.procedureName).toBe('MYLIB.PROC');
+    expect(cstmt.hasReturn).toBe(false);
+  });
+
+  test('execute() builds "? = CALL FUNC(...)" SQL for function-return form', async () => {
+    // End-to-end: the parsed `{ ? = call FUNC(?, ?) }` MUST produce
+    // `? = CALL LIB.FUNC(?, ?)` on the wire, with slot 1 bound as the
+    // return and slots 2..N as the procedure's arguments. Previously
+    // execute() rebuilt the SQL from only the slots the caller touched
+    // and dropped the `?=` entirely.
+    const preparedSqls = [];
+    const conn = {
+      async prepare(sql) {
+        preparedSqls.push(sql);
+        return {
+          async executeCall(params) {
+            return {
+              parameterRow: { col0: 999, col1: 'x', col2: 42 },
+              parameterDescriptors: [
+                { index: 0, name: '', sqlType: 496 },
+                { index: 1, name: '', sqlType: 448 },
+                { index: 2, name: '', sqlType: 496 },
+              ],
+              sqlca: { sqlCode: 0 },
+              sentParams: params,
+            };
+          },
+          async close() {},
+        };
+      },
+    };
+    const cstmt = new CallableStatement(conn, '{ ? = call LIB.FUNC(?, ?) }');
+    cstmt.registerOutParameter(1, 'integer'); // return slot
+    cstmt.setObject(2, 'x');
+    cstmt.setObject(3, 42);
+    await cstmt.execute();
+    expect(preparedSqls[0]).toBe('? = CALL LIB.FUNC(?, ?)');
+    expect(cstmt.getInt(1)).toBe(999);
+  });
+
+  test('execute() uses declaredParamCount, not just touched slots', async () => {
+    // Previously `CALL PROC(?, ?)` with only slot 1 populated produced
+    // the wrong SQL `CALL PROC(?)`. Now the declared marker count is
+    // authoritative — untouched declared slots must throw before we
+    // even prepare.
+    const conn = {
+      async prepare() {
+        throw new Error('prepare should not be reached on invalid input');
+      },
+    };
+    const cstmt = new CallableStatement(conn, 'CALL LIB.PROC(?, ?)');
+    cstmt.setObject(1, 'a');
+    await expect(cstmt.execute()).rejects.toThrow(
+      /parameter 2 of 2 was not set/,
+    );
+  });
+
+  test('execute() emits the full declared marker count in SQL', async () => {
+    const preparedSqls = [];
+    const conn = {
+      async prepare(sql) {
+        preparedSqls.push(sql);
+        return {
+          async executeCall() {
+            // Procedure with no OUT params; engine still returns a
+            // parameterRow object (possibly empty) so we stay on the
+            // protocol path and don't need executeForStream.
+            return { sqlca: { sqlCode: 0 }, parameterRow: {} };
+          },
+          async executeForStream() {
+            return { columns: [], async toArray() { return []; }, async close() {} };
+          },
+          async close() {},
+        };
+      },
+    };
+    const cstmt = new CallableStatement(conn, '{ call LIB.THREE(?, ?, ?) }');
+    cstmt.setObject(1, 1);
+    cstmt.setObject(2, 2);
+    cstmt.setObject(3, 3);
+    await cstmt.execute();
+    expect(preparedSqls[0]).toBe('CALL LIB.THREE(?, ?, ?)');
   });
 });
 

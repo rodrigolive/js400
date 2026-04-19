@@ -134,4 +134,30 @@ describe('DatabaseMetaData', () => {
       TABLE_SCHEM: 'MYLIB',
     });
   });
+
+  test('positioned-update metadata reflects the live-qualified cursor-name path', () => {
+    const md = new DatabaseMetaData(createMockConnection([]));
+    expect(md.supportsPositionedDelete()).toBe(true);
+    expect(md.supportsPositionedUpdate()).toBe(true);
+  });
+
+  test('capability flags match runtime reality (no false positives)', () => {
+    const md = new DatabaseMetaData(createMockConnection([]));
+    // Multi-result-set machinery exists as API shape only — the engine
+    // never surfaces additional server-side result sets today, so the
+    // metadata must NOT report these as supported.
+    expect(md.supportsMultipleResultSets()).toBe(false);
+    expect(md.supportsMultipleOpenResults()).toBe(false);
+
+    // Scroll types: FORWARD_ONLY and SCROLL_INSENSITIVE are honored;
+    // SCROLL_SENSITIVE is not (no server-side sensitive scroll).
+    expect(md.supportsResultSetType(1003)).toBe(true);  // FORWARD_ONLY
+    expect(md.supportsResultSetType(1004)).toBe(true);  // SCROLL_INSENSITIVE
+    expect(md.supportsResultSetType(1005)).toBe(false); // SCROLL_SENSITIVE
+
+    // Concurrency: only CONCUR_READ_ONLY, and only for supported types.
+    expect(md.supportsResultSetConcurrency(1007, 1003)).toBe(true);
+    expect(md.supportsResultSetConcurrency(1007, 1005)).toBe(false);
+    expect(md.supportsResultSetConcurrency(1008, 1003)).toBe(false); // CONCUR_UPDATABLE
+  });
 });

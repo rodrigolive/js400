@@ -3,6 +3,9 @@
  */
 import { describe, test, expect } from 'bun:test';
 import { Connection } from '../../src/db/api/Connection.js';
+import { connect } from '../../src/db/connect.js';
+import { AS400 } from '../../src/core/AS400.js';
+import { DbConnection } from '../../src/db/engine/DbConnection.js';
 
 /**
  * Create a mock DbConnection.
@@ -215,5 +218,37 @@ describe('Connection', () => {
     expect(conn.getAutoCommit()).toBe(false);
     conn.setAutoCommit(true);
     expect(conn.getAutoCommit()).toBe(true);
+  });
+});
+
+describe('sql.connect()', () => {
+  test('host/user/password path signs on the AS400 instance before building DbConnection', async () => {
+    let signonCalls = 0;
+    let dbConnectCalls = 0;
+
+    const origSignon = AS400.prototype.signon;
+    const origDbConnect = DbConnection.prototype.connect;
+
+    AS400.prototype.signon = async function signonStub() {
+      signonCalls++;
+    };
+    DbConnection.prototype.connect = async function dbConnectStub() {
+      dbConnectCalls++;
+    };
+
+    try {
+      const conn = await connect({
+        host: 'example.test',
+        user: 'USER',
+        password: 'PASS',
+      });
+
+      expect(signonCalls).toBe(1);
+      expect(dbConnectCalls).toBe(1);
+      expect(conn).toBeInstanceOf(Connection);
+    } finally {
+      AS400.prototype.signon = origSignon;
+      DbConnection.prototype.connect = origDbConnect;
+    }
   });
 });

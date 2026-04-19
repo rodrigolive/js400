@@ -190,6 +190,19 @@ export class ConnectionPoolDataSource extends DataSource {
 
   /**
    * Return (or lazily create) the underlying ConnectionPool.
+   *
+   * Lifecycle contract:
+   *   - The pool is created on the first `getPool()` call using a snapshot
+   *     of the DataSource's properties at that moment (via
+   *     `toConnectOptions()`).
+   *   - Subsequent mutations to DataSource properties (e.g. calling
+   *     `setLibraries()` after `getPool()`) do NOT retroactively affect
+   *     the already-created pool. This is deliberate: rebuilding the
+   *     pool on every setter would cause silent pool churn and
+   *     reconnect storms from innocent setter calls.
+   *   - To reconfigure, call `closePool()` first, then mutate properties,
+   *     then call `getPool()` again.
+   *
    * @param {object} [poolOpts] - pool size / timeout options
    */
   getPool(poolOpts = {}) {
@@ -202,6 +215,20 @@ export class ConnectionPoolDataSource extends DataSource {
       });
     }
     return this.#pool;
+  }
+
+  /**
+   * Close the current pool (if any) and forget it. A subsequent
+   * `getPool()` call will create a fresh pool that picks up the latest
+   * DataSource properties. No-op when no pool was ever created.
+   * @returns {Promise<void>}
+   */
+  async closePool() {
+    const pool = this.#pool;
+    this.#pool = null;
+    if (pool) {
+      try { await pool.close(); } catch { /* ignore */ }
+    }
   }
 
   /**
@@ -262,6 +289,12 @@ export class ConnectionPoolDataSource extends DataSource {
       removeConnectionEventListener(l) {
         listeners.connection = listeners.connection.filter(x => x !== l);
       },
+      // Statement listeners are accepted for JDBC shape parity but
+      // no `statementClosed` / `statementErrorOccurred` events are
+      // emitted today. Callers that rely on these events will see
+      // nothing — do not depend on them until the Statement layer
+      // starts firing events. This is intentional and documented
+      // in docs/sql-feature-matrix.md.
       addStatementEventListener(l) { if (l) listeners.statement.push(l); },
       removeStatementEventListener(l) {
         listeners.statement = listeners.statement.filter(x => x !== l);

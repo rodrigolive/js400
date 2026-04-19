@@ -12,7 +12,8 @@
 import { ResultSet } from './ResultSet.js';
 import { ResultSetMetaData } from './ResultSetMetaData.js';
 import { ParameterMetaData } from './ParameterMetaData.js';
-import { SqlWarning } from './SqlWarning.js';
+import { SqlWarning, warningFromSqlca } from './SqlWarning.js';
+import { SqlError } from '../../core/errors.js';
 import { SqlArray } from './SqlArray.js';
 import { RowId } from './RowId.js';
 import { Blob } from '../lob/Blob.js';
@@ -21,6 +22,15 @@ import { SQLXML } from '../lob/SQLXML.js';
 
 /** Sentinel used by `setNull` to mark a bound parameter as SQL NULL. */
 export const SQL_NULL = Symbol.for('js400.sql.null');
+
+/**
+ * Default *row count* for cursor FETCH requests when the caller did not
+ * call `setFetchSize()`. Distinct from the engine's OPEN blocking factor
+ * (which is in *bytes*): the FETCH protocol's BLOCKING_FACTOR is a row
+ * count, so feeding the byte-level open default in here would silently
+ * blow up the per-fetch row count.
+ */
+const DEFAULT_FETCH_ROWS = 2048;
 
 export class PreparedStatement {
   #dbConnection;
@@ -34,6 +44,7 @@ export class PreparedStatement {
   #fetchSize;
   #maxRows;
   #queryTimeout;
+  #cancelled;          // set by cancel() or by the queryTimeout watchdog
   #batchRows;
   #lastGeneratedKeys;  // { rows, columnDescriptors } | null
   #onClose;            // async cleanup hook: releases handle to cache or closes it
@@ -60,6 +71,7 @@ export class PreparedStatement {
     this.#fetchSize = 0;
     this.#maxRows = 0;
     this.#queryTimeout = 0;
+    this.#cancelled = false;
     this.#batchRows = null;
     this.#lastGeneratedKeys = null;
     this.#onClose = typeof opts.onClose === 'function' ? opts.onClose : null;
@@ -168,10 +180,27 @@ export class PreparedStatement {
 
   // --- Query resource control ---
 
+  /**
+   * JDBC `Statement.getCursorName()` analogue. Returns the cursor
+   * name the underlying RPB was prepared with — either the
+   * caller-supplied name (passed to `Connection.prepare(sql, {
+   * cursorName })`) or the engine's auto-generated `CRSR<rpbId>`.
+   * Useful for building positioned `UPDATE / DELETE WHERE CURRENT
+   * OF <name>` statements against the same connection.
+   */
+  getCursorName() { return this.#stmtHandle?.cursorName ?? null; }
+
   setFetchSize(n)    { this.#fetchSize = Math.max(0, n | 0); return this; }
   getFetchSize()     { return this.#fetchSize; }
   setMaxRows(n)      { this.#maxRows = Math.max(0, n | 0); return this; }
   getMaxRows()       { return this.#maxRows; }
+  // queryTimeout is honored by `#runWithCancellation()` on every
+  // execute path. n=0 takes the fast path (no timer, no allocation).
+  // n>0 arms a per-execute `setTimeout(n*1000)` that flips
+  // `#cancelled`; after the in-flight RTT returns, the wrapper
+  // throws `SqlError(HY008)` "Query timeout exceeded". No mid-RTT
+  // preemption (would need a side connection à la JTOpen
+  // `AS400JDBCConnectionImpl.cancel`).
   setQueryTimeout(n) { this.#queryTimeout = Math.max(0, n | 0); return this; }
   getQueryTimeout()  { return this.#queryTimeout; }
 
@@ -184,6 +213,85 @@ export class PreparedStatement {
     if (!this.#warnings) this.#warnings = w;
     else this.#warnings.setNextWarning(w);
   }
+
+  /**
+   * Fast-path SQLCA → warning adapter. Folds any warning bits on the
+   * reply's SQLCA into this statement's warning chain without
+   * allocating or branching on the success path: the entire body
+   * short-circuits when `warningFromSqlca()` returns null.
+   */
+  #propagateSqlcaWarning(sqlca) {
+    const w = warningFromSqlca(sqlca);
+    if (w) this.addWarning(w);
+  }
+
+  /**
+   * Cancel-and-timeout wrapper for the engine call. Three states:
+   *
+   *   - `queryTimeout = 0` and not cancelled: the fast path. One
+   *     boolean check, then the wrapped invocation runs untouched.
+   *     No timer, no allocation.
+   *   - `cancelled` is set BEFORE invocation: throw HY008 immediately
+   *     and clear the flag.
+   *   - `queryTimeout > 0`: arm a `setTimeout` that flips `#cancelled`
+   *     after `queryTimeout` seconds. After the engine call returns
+   *     (or throws), if the flag is set, throw HY008. The watchdog
+   *     does NOT preempt an in-flight RTT — single-connection
+   *     architecture has no side channel to inject `FUNCTIONID_CANCEL`
+   *     mid-flight; that would need a separate connection (JTOpen
+   *     pattern at `AS400JDBCConnectionImpl.cancel`). The next
+   *     operation after a slow RTT sees the cancel.
+   *
+   * @template T
+   * @param {() => Promise<T>} invoke
+   * @returns {Promise<T>}
+   */
+  async #runWithCancellation(invoke) {
+    if (this.#cancelled) {
+      this.#cancelled = false;
+      throw new SqlError('Statement was cancelled', {
+        messageId: 'HY008', returnCode: -952,
+      });
+    }
+    if (this.#queryTimeout <= 0) {
+      // Fast path: no watchdog, no extra allocation.
+      return invoke();
+    }
+    let timer = null;
+    let invokeError = null;
+    let result;
+    try {
+      timer = setTimeout(
+        () => { this.#cancelled = true; },
+        this.#queryTimeout * 1000,
+      );
+      result = await invoke();
+    } catch (e) {
+      invokeError = e;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (this.#cancelled) {
+      this.#cancelled = false;
+      throw new SqlError('Query timeout exceeded', {
+        messageId: 'HY008', returnCode: -952,
+      });
+    }
+    if (invokeError) throw invokeError;
+    return result;
+  }
+
+  /**
+   * Mark the statement as cancelled. The next operation throws
+   * `SqlError(HY008)`. Currently client-side only — a real wire-level
+   * cancel requires a side connection (JTOpen
+   * `AS400JDBCConnectionImpl.cancel`) which this driver does not yet
+   * open. Calling `cancel()` while no execute is in flight still
+   * affects the next execute.
+   */
+  cancel() { this.#cancelled = true; }
+  /** @returns {boolean} */
+  isCancelled() { return this.#cancelled; }
 
   // --- Execution ---
 
@@ -200,10 +308,12 @@ export class PreparedStatement {
    */
   async execute(params, opts = {}) {
     this.#ensureOpen();
-    // Per JDBC: getGeneratedKeys() after a non-generated-keys execute
-    // must be empty, not stale data from a prior call. Clear at the
-    // top so the state reflects THIS execute only.
+    // Per JDBC (AS400JDBCStatement.commonExecuteBefore): clear both
+    // the generated-keys cache AND the warning chain at the top so
+    // subsequent `getWarnings()` / `getGeneratedKeys()` reflect only
+    // this execute, not a prior one.
     this.#lastGeneratedKeys = null;
+    this.#warnings = null;
     const effective = await this.#resolveWrappers(this.#effectiveParams(params));
 
     // Generated-keys path: wrap the INSERT in SELECT * FROM FINAL TABLE (...)
@@ -214,9 +324,10 @@ export class PreparedStatement {
       const wrappedSql = `SELECT * FROM FINAL TABLE (${this.#sql})`;
       const wrappedHandle = await this.#dbConnection.prepareStatement(wrappedSql);
       try {
-        const wrappedResult = await this.#dbConnection.statementManager.execute(
-          wrappedHandle, effective,
+        const wrappedResult = await this.#runWithCancellation(
+          () => this.#dbConnection.statementManager.execute(wrappedHandle, effective),
         );
+        this.#propagateSqlcaWarning(wrappedResult.sqlca);
         const rows = wrappedResult.hasResultSet ? wrappedResult.rows : [];
         this.#lastGeneratedKeys = {
           rows: [...rows],
@@ -231,9 +342,12 @@ export class PreparedStatement {
       }
     }
 
-    const result = await this.#dbConnection.statementManager.execute(
-      this.#stmtHandle, effective, opts,
+    const result = await this.#runWithCancellation(
+      () => this.#dbConnection.statementManager.execute(
+        this.#stmtHandle, effective, opts,
+      ),
     );
+    this.#propagateSqlcaWarning(result.sqlca);
 
     if (result.hasResultSet) {
       const rs = new ResultSet({
@@ -242,10 +356,19 @@ export class PreparedStatement {
         cursorManager: this.#dbConnection.cursorManager,
         rpbId: result.rpbId,
         endOfData: result.endOfData,
-        fetchSize: this.#fetchSize || (result.blockingFactor ?? 2048),
+        fetchSize: this.#fetchSize || result.defaultFetchRows || DEFAULT_FETCH_ROWS,
       });
-      const all = await rs.toArray();
-      return this.#maxRows > 0 ? all.slice(0, this.#maxRows) : all;
+      try {
+        const all = await rs.toArray();
+        return this.#maxRows > 0 ? all.slice(0, this.#maxRows) : all;
+      } finally {
+        // Close the server-side cursor before returning. Without this
+        // step, a prepared-SELECT handle that later gets returned to
+        // the statement cache carries an open cursor on the host, and
+        // the next reuse fails with SQLCODE -502 ("cursor already
+        // open"). The close is idempotent; the engine handle lives on.
+        try { await rs.close(); } catch { /* ignore close errors */ }
+      }
     }
 
     return {
@@ -297,10 +420,18 @@ export class PreparedStatement {
    */
   async executeForStream(params) {
     this.#ensureOpen();
+    // Stream path is a second execute on the same prepared handle.
+    // Clear per-execute state (generated keys + warning chain) so
+    // `getWarnings()` / `getGeneratedKeys()` reflect only this call.
+    this.#lastGeneratedKeys = null;
+    this.#warnings = null;
     const effective = await this.#resolveWrappers(this.#effectiveParams(params));
-    const result = await this.#dbConnection.statementManager.execute(
-      this.#stmtHandle, effective,
+    const result = await this.#runWithCancellation(
+      () => this.#dbConnection.statementManager.execute(
+        this.#stmtHandle, effective,
+      ),
     );
+    this.#propagateSqlcaWarning(result.sqlca);
 
     return new ResultSet({
       rows: result.rows,
@@ -308,8 +439,40 @@ export class PreparedStatement {
       cursorManager: this.#dbConnection.cursorManager,
       rpbId: result.rpbId,
       endOfData: result.endOfData,
-      fetchSize: this.#fetchSize || (result.blockingFactor ?? 2048),
+      fetchSize: this.#fetchSize || result.defaultFetchRows || DEFAULT_FETCH_ROWS,
     });
+  }
+
+  /**
+   * Callable-only execute path that surfaces the protocol-level
+   * OUT/INOUT parameter row returned by a CALL reply.
+   *
+   * Returns the raw engine-layer result. The engine detects CALL
+   * statements internally and, when the host server returns code point
+   * 0x380E with parameter values, decodes those values using the
+   * prepared statement's parameter descriptors. The caller (a
+   * `CallableStatement`) is responsible for mapping the decoded values
+   * onto registered OUT/INOUT slots.
+   *
+   * This is an internal seam: no public shape on `PreparedStatement` —
+   * we just forward the raw execute result. Use `execute()` for normal
+   * DML/SELECT flow.
+   *
+   * @param {any[]} [params]
+   * @returns {Promise<object>} raw StatementManager.execute result
+   */
+  async executeCall(params) {
+    this.#ensureOpen();
+    // Clear per-execute state so callable warnings reflect only
+    // this call when CallableStatement pulls them out of this handle
+    // after the CALL reply.
+    this.#warnings = null;
+    const effective = await this.#resolveWrappers(this.#effectiveParams(params));
+    const result = await this.#runWithCancellation(
+      () => this.#dbConnection.statementManager.execute(this.#stmtHandle, effective),
+    );
+    this.#propagateSqlcaWarning(result.sqlca);
+    return result;
   }
 
   /**
@@ -350,6 +513,12 @@ export class PreparedStatement {
    */
   async executeBatch(paramSets) {
     this.#ensureOpen();
+    // Batch executes do not return generated keys, but JDBC contract
+    // requires getGeneratedKeys() and getWarnings() after any execute
+    // to reflect THIS execute only — never a stale capture from an
+    // earlier call.
+    this.#lastGeneratedKeys = null;
+    this.#warnings = null;
     const batchSize = paramSets?.length ?? 0;
     if (batchSize === 0) {
       return { updateCounts: [], totalAffected: 0 };
@@ -363,9 +532,12 @@ export class PreparedStatement {
       ? await this.#resolveWrapperSets(paramSets)
       : paramSets;
 
-    const result = await this.#dbConnection.statementManager.executeBatch(
-      this.#stmtHandle, effectiveSets,
+    const result = await this.#runWithCancellation(
+      () => this.#dbConnection.statementManager.executeBatch(
+        this.#stmtHandle, effectiveSets,
+      ),
     );
+    this.#propagateSqlcaWarning(result.sqlca);
 
     const perRow = (result.isInsert && result.affectedRows === batchSize) ? 1 : -2;
     const updateCounts = new Array(batchSize).fill(perRow);

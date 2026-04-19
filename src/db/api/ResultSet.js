@@ -677,11 +677,11 @@ export class ResultSet {
   }
 
   #ensureScrollable() {
-    // The underlying host cursor is forward-only; scrollable positioning
-    // only works on rows already materialized into memory.
-    if (this.#type === ResultSetType.forwardOnly) {
-      // Allow scrolling inside the materialized buffer but not across
-      // partially-consumed server cursors.
-    }
+    // The underlying host cursor is forward-only; `absolute()`,
+    // `relative()`, `previous()`, `first()` and `last()` reposition
+    // inside the materialized row buffer only. They never re-issue
+    // a fetch against a prior position. JDBC metadata reports
+    // SCROLL_INSENSITIVE as supported (buffered), SCROLL_SENSITIVE
+    // as unsupported (no server sensitive scroll).
   }
 }

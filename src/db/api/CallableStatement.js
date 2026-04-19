@@ -16,6 +16,8 @@ import { RowId } from './RowId.js';
 import { Blob } from '../lob/Blob.js';
 import { Clob } from '../lob/Clob.js';
 import { SQLXML } from '../lob/SQLXML.js';
+import { ResultSet } from './ResultSet.js';
+import { CLOSE_CURRENT_RESULT, KEEP_CURRENT_RESULT, CLOSE_ALL_RESULTS } from './Statement.js';
 
 /**
  * Map a concise type descriptor used by `call()` to a SQL type string.
@@ -60,6 +62,58 @@ function buildCallSql(name, total) {
 }
 
 /**
+ * Parse JDBC call syntax accepted by `Connection.prepareCall()`.
+ * Recognized forms:
+ *
+ *   - bare procedure name:           `MYLIB.PROC`
+ *   - bare CALL:                     `CALL MYLIB.PROC(?, ?)`
+ *   - JDBC escape, procedure:        `{ call MYLIB.PROC(?, ?) }`
+ *   - JDBC escape, function return:  `{ ? = call MYLIB.FUNC(?, ?) }`
+ *
+ * Parameter markers (`?`) inside string / identifier literals are not
+ * counted. The leading `?` before `=` is treated as an implicit OUT
+ * parameter at slot 1; the rest of the markers become slots 2..N.
+ *
+ * @param {string} text
+ * @returns {{ procedureName: string|null, paramCount: number, hasReturn: boolean }|null}
+ */
+export function parseCallText(text) {
+  if (text == null) return null;
+  let s = String(text).trim();
+  if (!s) return null;
+  if (s.startsWith('{') && s.endsWith('}')) {
+    s = s.slice(1, -1).trim();
+  }
+  let hasReturn = false;
+  const retMatch = /^\?\s*=\s*/.exec(s);
+  if (retMatch) {
+    hasReturn = true;
+    s = s.slice(retMatch[0].length).trim();
+  }
+  const callMatch = /^call\b\s*/i.exec(s);
+  if (callMatch) s = s.slice(callMatch[0].length).trim();
+  let procedureName = s;
+  let argText = '';
+  const openIdx = s.indexOf('(');
+  if (openIdx >= 0) {
+    procedureName = s.slice(0, openIdx).trim();
+    const closeIdx = s.lastIndexOf(')');
+    if (closeIdx > openIdx) argText = s.slice(openIdx + 1, closeIdx);
+  }
+  if (!procedureName) procedureName = null;
+  let paramCount = 0;
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < argText.length; i++) {
+    const ch = argText.charCodeAt(i);
+    if (ch === 0x27 /* ' */ && !inDouble) inSingle = !inSingle;
+    else if (ch === 0x22 /* " */ && !inSingle) inDouble = !inDouble;
+    else if (ch === 0x3F /* ? */ && !inSingle && !inDouble) paramCount++;
+  }
+  return { procedureName, paramCount, hasReturn };
+}
+
+/**
  * Parameter slot used internally to track IN/OUT/INOUT registrations.
  * @typedef {object} Slot
  * @property {string} [name]
@@ -77,28 +131,117 @@ export class CallableStatement {
   #outValues;             // 1-based array of last-executed OUT values
   #wasNull;
   #warnings;
-  #resultSets;            // array<object[]>
+  #resultSets;            // array<object[]> — legacy plain-array projection
+  #resultSetQueue;        // ResultSet[] — JDBC-style streaming queue
+  #currentResultSet;      // ResultSet|null — head of the queue
   #executed;
+  #hasReturn;             // true when constructed from `{ ? = call ... }`
+  #declaredParamCount;    // total `?` markers seen at parse time (incl. return)
 
   /**
+   * Accepts JDBC call syntax in addition to a bare procedure name:
+   *   - `MYLIB.PROC`                          (legacy js400 form)
+   *   - `CALL MYLIB.PROC(?, ?)`               (bare CALL)
+   *   - `{ call MYLIB.PROC(?, ?) }`           (JDBC escape)
+   *   - `{ ? = call MYLIB.FUNC(?, ?) }`       (function return value)
+   *
+   * When the input contains a function-return form, slot 1 is reserved
+   * as an implicit OUT parameter for the return value.
+   *
    * @param {object} connection - a Connection instance with prepare()
-   * @param {string} [procedureName] - fully qualified procedure name
+   * @param {string} [callTextOrName] - JDBC call text or bare proc name
    */
-  constructor(connection, procedureName) {
+  constructor(connection, callTextOrName) {
     this.#connection = connection;
-    this.#procedureName = procedureName || null;
     this.#slots = [];
     this.#nameToIndex = new Map();
     this.#outValues = [];
     this.#wasNull = false;
     this.#warnings = null;
     this.#resultSets = [];
+    this.#resultSetQueue = [];
+    this.#currentResultSet = null;
     this.#executed = false;
+    this.#hasReturn = false;
+    this.#declaredParamCount = 0;
+
+    const parsed = parseCallText(callTextOrName);
+    this.#procedureName = parsed?.procedureName ?? null;
+    this.#hasReturn = Boolean(parsed?.hasReturn);
+    this.#declaredParamCount = parsed?.paramCount ?? 0;
+    if (this.#hasReturn) {
+      // Reserve slot 1 as the function return value (OUT, type unknown
+      // until registerOutParameter() is called by the caller).
+      this.#slots[1] = {
+        mode: ParameterMode.out,
+        value: null,
+        typeDesc: null,
+        name: 'RETURN_VALUE',
+      };
+      this.#nameToIndex.set('RETURN_VALUE', 1);
+    }
   }
 
   get procedureName() { return this.#procedureName; }
   get parameterCount() { return this.#slots.length; }
+  /**
+   * Legacy plain-array projection of all decoded result sets from
+   * the most recent `execute()`. New code should iterate via
+   * `getResultSet()` + `getMoreResults()` to mirror JDBC.
+   */
   get resultSets() { return this.#resultSets; }
+  /** True when constructed from `{ ? = call FUNC(...) }` syntax. */
+  get hasReturn() { return this.#hasReturn; }
+
+  /**
+   * JDBC `Statement.getResultSet()`: returns the current result set,
+   * or `null` when the most recent execute returned only OUT
+   * parameters.
+   * @returns {ResultSet|null}
+   */
+  getResultSet() { return this.#currentResultSet; }
+
+  /**
+   * JDBC `Statement.getMoreResults(current)`: advances to the next
+   * result set returned by the procedure. Returns `true` when the
+   * advance landed on a fresh `ResultSet`, `false` when no more
+   * result sets remain.
+   *
+   * Disposition codes (re-exported from `Statement.js`):
+   *   - `CLOSE_CURRENT_RESULT` (default) — close the current set
+   *     before moving on.
+   *   - `KEEP_CURRENT_RESULT` — leave the current set open; the
+   *     caller is responsible for closing it.
+   *   - `CLOSE_ALL_RESULTS` — close the current set AND every queued
+   *     pending set, then return `false`.
+   *
+   * @param {number} [current=CLOSE_CURRENT_RESULT]
+   * @returns {Promise<boolean>}
+   */
+  async getMoreResults(current = CLOSE_CURRENT_RESULT) {
+    if (current === CLOSE_ALL_RESULTS) {
+      if (this.#currentResultSet) {
+        try { await this.#currentResultSet.close(); } catch { /* ignore */ }
+      }
+      for (const rs of this.#resultSetQueue) {
+        try { await rs.close(); } catch { /* ignore */ }
+      }
+      this.#resultSetQueue = [];
+      this.#currentResultSet = null;
+      return false;
+    }
+    if (current === CLOSE_CURRENT_RESULT && this.#currentResultSet) {
+      try { await this.#currentResultSet.close(); } catch { /* ignore */ }
+    }
+    // KEEP_CURRENT_RESULT leaves the prior ResultSet open; the
+    // caller now owns it.
+    if (this.#resultSetQueue.length === 0) {
+      this.#currentResultSet = null;
+      return false;
+    }
+    this.#currentResultSet = this.#resultSetQueue.shift();
+    return true;
+  }
 
   /**
    * Register an OUT parameter at the given 1-based index.
@@ -318,10 +461,67 @@ export class CallableStatement {
     if (!this.#procedureName) {
       throw new Error('CallableStatement: procedureName not set');
     }
-    const total = this.#slots.filter(Boolean).length;
-    const sql = buildCallSql(this.#procedureName, total);
+
+    // JDBC parity: clear the callable's warning chain AND any
+    // queued result sets at the start of every execute so
+    // `getWarnings()` / `getResultSet()` / `getMoreResults()`
+    // reflect only this call. The inner prepared statement's
+    // warnings will be folded in after the reply.
+    this.#warnings = null;
+    if (this.#currentResultSet) {
+      try { await this.#currentResultSet.close(); } catch { /* ignore */ }
+    }
+    for (const rs of this.#resultSetQueue) {
+      try { await rs.close(); } catch { /* ignore */ }
+    }
+    this.#resultSetQueue = [];
+    this.#currentResultSet = null;
+    this.#resultSets = [];
+
+    // Authoritative slot count:
+    //   1. If the CallableStatement was constructed from parsed JDBC
+    //      call text, the parse tree is the source of truth: the
+    //      declared marker count plus (optionally) the return slot
+    //      must all be set before execute().
+    //   2. Otherwise we are in the legacy `call()` helper flow where
+    //      the caller materialized slots dynamically; honor whatever
+    //      they populated.
+    const totalSlots = this.#declaredParamCount > 0
+      ? (this.#hasReturn ? 1 + this.#declaredParamCount : this.#declaredParamCount)
+      : this.#slots.filter(Boolean).length;
+
+    // Enforce declared-count parity when the call text declared it.
+    // This closes the old "CALL PROC(?,?) with only slot 1 touched
+    // becomes CALL PROC(?)" trap.
+    if (this.#declaredParamCount > 0) {
+      for (let i = 1; i <= totalSlots; i++) {
+        if (!this.#slots[i]) {
+          throw new Error(
+            `CallableStatement: parameter ${i} of ${totalSlots} `
+            + `was not set (procedure ${this.#procedureName})`
+          );
+        }
+      }
+    }
+
+    // Build the CALL SQL respecting the parsed shape:
+    //   - `{ ? = call FUNC(?, ?) }` →  `? = CALL FUNC(?, ?)`
+    //   - `CALL PROC(?, ?)`         →  `CALL PROC(?, ?)`
+    //   - `MYLIB.PROC` legacy form  →  `CALL MYLIB.PROC(?, ?, ...)`
+    // In the return-value form the leading `?` is the function's
+    // return marker — it is bound as the first parameter value at
+    // send time, and DB2 for i fills it on the reply (same decode
+    // path as any OUT parameter).
+    const argMarkerCount = this.#hasReturn ? totalSlots - 1 : totalSlots;
+    const argMarkers = argMarkerCount > 0
+      ? Array(argMarkerCount).fill('?').join(', ')
+      : '';
+    const sql = this.#hasReturn
+      ? `? = CALL ${this.#procedureName}(${argMarkers})`
+      : buildCallSql(this.#procedureName, argMarkerCount);
+
     const params = [];
-    for (let i = 1; i <= total; i++) {
+    for (let i = 1; i <= totalSlots; i++) {
       const s = this.#slots[i];
       if (!s) throw new Error(`Parameter ${i} not set`);
       // For OUT params, send null; the host server will populate them
@@ -331,93 +531,175 @@ export class CallableStatement {
     const stmt = await this.#connection.prepare(sql);
     let resultSetHandle = null;
     try {
-      // PARTIAL OUT/INOUT PARITY — NOT FULL PROTOCOL DECODE.
-      //
-      // JTOpen's AS400JDBCCallableStatement decodes OUT / INOUT values
-      // from the CALL reply's parameter-row block (DBData parameterRow_,
-      // sourced from the 0x3810-family reply code points). js400 does
-      // not yet have that engine-layer decoder. Until it does, this
-      // path uses a conservative, DETERMINISTIC fallback that only
-      // populates OUT slots when the procedure also emits its outputs
-      // as a result-set row (a common DB2 idiom).
-      //
-      // Fallback rules (applied in order, no object-order dependency):
-      //   1. If exactly one result set is produced and it has exactly
-      //      one row, attempt to project column values onto OUT/INOUT
-      //      slots:
-      //        a. Slots that have a registered parameter name
-      //           (setParameterName / named getter) match columns with
-      //           the same name (case-insensitive).
-      //        b. Remaining unmatched OUT/INOUT slots fall back to
-      //           the declared column-descriptor order from the result
-      //           set's metadata (NOT Object.values order).
-      //   2. If the shape can't be matched deterministically, every
-      //      OUT slot is left as null.
-      //
-      // setOutValue() remains the explicit override path for protocol-
-      // level populations once the engine grows a 0x3810 decoder.
-      resultSetHandle = await stmt.executeForStream(params);
-      const rows = await resultSetHandle.toArray();
-      const columnDescriptors = resultSetHandle.columns || [];
-      const resultSets = rows.length > 0 ? [rows] : [];
-      this.#resultSets = resultSets;
-
-      this.#outValues = new Array(total + 1).fill(null);
+      this.#outValues = new Array(totalSlots + 1).fill(null);
       const outSlotIdxs = [];
-      for (let i = 1; i <= total; i++) {
+      for (let i = 1; i <= totalSlots; i++) {
         const s = this.#slots[i];
         if (s && (s.mode === ParameterMode.out || s.mode === ParameterMode.inOut)) {
           outSlotIdxs.push(i);
         }
       }
 
-      if (rows.length === 1 && outSlotIdxs.length > 0 && columnDescriptors.length > 0) {
-        const row = rows[0];
-        // Build an (upper-case column name) → value map in descriptor
-        // order so lookup is deterministic regardless of JS object
-        // key order.
-        const columnOrder = columnDescriptors.map(d => d.name || d.label || '');
-        const colByName = new Map();
-        for (const name of columnOrder) {
-          if (name && !colByName.has(name.toUpperCase())) {
-            colByName.set(name.toUpperCase(), row[name]);
-          }
-        }
-        const usedColumnIdx = new Set();
+      // Primary path — protocol-level OUT / INOUT decode.
+      //
+      // JTOpen's AS400JDBCCallableStatement reads OUT values from the
+      // CALL reply's parameter-row block (DBData parameterRow_, sourced
+      // from the 0x380E RESULT_DATA code point; the request must set the
+      // ORS RESULT_DATA bit). In js400 this work lives in
+      // `StatementManager.execute()` for CALL statements and surfaces as
+      // `{ parameterRow, parameterDescriptors }` on the execute result.
+      // When that row is present we decode OUT slots from it directly —
+      // no result-set materialization, no toArray() fan-out.
+      //
+      // Fallback path — DETERMINISTIC result-set heuristic.
+      //
+      // Some procedure idioms emit their outputs as a one-row result
+      // set via `VALUES (...)` rather than through real OUT markers.
+      // When the protocol path returns no parameter row, we fall back
+      // to matching that one row onto OUT slots by registered parameter
+      // name first, then declared column-descriptor order. If the shape
+      // can't be matched, OUT slots stay null.
+      const callResult = typeof stmt.executeCall === 'function'
+        ? await stmt.executeCall(params)
+        : null;
 
-        // Pass 1: match by registered slot name.
+      let resultSets = [];
+
+      if (callResult?.parameterRow) {
+        const descs = callResult.parameterDescriptors || [];
+        const row = callResult.parameterRow;
         for (const idx of outSlotIdxs) {
-          const slot = this.#slots[idx];
-          const slotName = slot?.name ? String(slot.name).toUpperCase() : null;
-          if (!slotName) continue;
-          const colIdx = columnOrder.findIndex(n => n && n.toUpperCase() === slotName);
-          if (colIdx >= 0 && !usedColumnIdx.has(colIdx)) {
-            this.#outValues[idx] = row[columnOrder[colIdx]];
-            usedColumnIdx.add(colIdx);
+          const desc = descs[idx - 1];
+          // Parameter descriptors parsed from code point 0x3808 often
+          // carry empty name strings — decodeResultData keys those
+          // columns as `col${desc.index}`. Prefer an explicit name
+          // when the host gave us one, otherwise use the positional
+          // fallback so the mapping is 1:1 with slot order.
+          const key = desc?.name && desc.name.length > 0
+            ? desc.name
+            : `col${idx - 1}`;
+          if (Object.prototype.hasOwnProperty.call(row, key)) {
+            this.#outValues[idx] = row[key];
           }
         }
+        // Procedures that return OUT params AND one or more result
+        // sets (DECLARE CURSOR + OPEN pattern). The engine surfaces
+        // each secondary 0x380E block as its own group; we wrap each
+        // decoded group in a real `ResultSet` and queue them so
+        // `getMoreResults()` can advance through them in order.
+        // Groups whose descriptor was missing keep their raw buffer
+        // surface as a `__raw` placeholder ResultSet (the consumer
+        // can detect it via `getMetaData().getColumnCount() === 0`).
+        const groups = Array.isArray(callResult.resultSetGroups)
+          ? callResult.resultSetGroups : [];
+        for (const g of groups) {
+          if (g.rows) {
+            resultSets.push(g.rows);
+            this.#resultSetQueue.push(new ResultSet({
+              rows: g.rows,
+              columnDescriptors: g.descriptors || [],
+              endOfData: true,
+            }));
+          } else if (g.__raw) {
+            // Raw fallback: descriptor unknown, no decoded rows.
+            // Surface as an empty ResultSet so the consumer can
+            // count it but not iterate.
+            resultSets.push({ __raw: g.__raw });
+            this.#resultSetQueue.push(new ResultSet({
+              rows: [],
+              columnDescriptors: [],
+              endOfData: true,
+            }));
+          }
+        }
+        // Pre-2026-04-18 compatibility: when no `resultSetGroups`
+        // came through (older engine path), fall back to the
+        // legacy single-group surface. `extraResultBuffers` is the
+        // legacy raw fallback when no descriptor was sent.
+        if (groups.length === 0
+            && Array.isArray(callResult.resultSetRows)
+            && callResult.resultSetRows.length > 0) {
+          resultSets = [callResult.resultSetRows];
+          this.#resultSetQueue.push(new ResultSet({
+            rows: callResult.resultSetRows,
+            columnDescriptors: callResult.resultSetDescriptors || [],
+            endOfData: true,
+          }));
+        } else if (groups.length === 0 && callResult.extraResultBuffers?.length) {
+          // No descriptor, no decoded groups, but raw 0x380E
+          // blocks remain. Preserve the legacy `__raw + note`
+          // surface so older callers / mocks still work.
+          resultSets = [{
+            __raw: callResult.extraResultBuffers,
+            note: 'CALL returned a result set alongside OUT parameters '
+              + 'but no descriptor arrived on the CALL reply. The raw '
+              + 'data buffers are preserved for a higher layer that '
+              + 'knows the shape out-of-band.',
+          }];
+        }
+        if (this.#resultSetQueue.length > 0) {
+          this.#currentResultSet = this.#resultSetQueue.shift();
+        }
+      } else {
+        resultSetHandle = await stmt.executeForStream(params);
+        const rows = await resultSetHandle.toArray();
+        const columnDescriptors = resultSetHandle.columns || [];
+        resultSets = rows.length > 0 ? [rows] : [];
 
-        // Pass 2: fill remaining unmatched OUT slots from column
-        // descriptors in declared order, skipping already-used columns.
-        const remainingSlots = outSlotIdxs.filter(idx => {
-          const slot = this.#slots[idx];
-          return !slot?.name || this.#outValues[idx] === null;
-        });
-        let nextCol = 0;
-        for (const idx of remainingSlots) {
-          if (this.#outValues[idx] !== null) continue;
-          while (nextCol < columnOrder.length && usedColumnIdx.has(nextCol)) nextCol++;
-          if (nextCol >= columnOrder.length) break;
-          this.#outValues[idx] = row[columnOrder[nextCol]];
-          usedColumnIdx.add(nextCol);
-          nextCol++;
+        if (rows.length === 1 && outSlotIdxs.length > 0 && columnDescriptors.length > 0) {
+          const row = rows[0];
+          const columnOrder = columnDescriptors.map(d => d.name || d.label || '');
+          const usedColumnIdx = new Set();
+
+          // Pass 1: match by registered slot name.
+          for (const idx of outSlotIdxs) {
+            const slot = this.#slots[idx];
+            const slotName = slot?.name ? String(slot.name).toUpperCase() : null;
+            if (!slotName) continue;
+            const colIdx = columnOrder.findIndex(n => n && n.toUpperCase() === slotName);
+            if (colIdx >= 0 && !usedColumnIdx.has(colIdx)) {
+              this.#outValues[idx] = row[columnOrder[colIdx]];
+              usedColumnIdx.add(colIdx);
+            }
+          }
+
+          // Pass 2: fill remaining OUT slots from column descriptors in
+          // declared order, skipping already-used columns.
+          const remainingSlots = outSlotIdxs.filter(idx => {
+            const slot = this.#slots[idx];
+            return !slot?.name || this.#outValues[idx] === null;
+          });
+          let nextCol = 0;
+          for (const idx of remainingSlots) {
+            if (this.#outValues[idx] !== null) continue;
+            while (nextCol < columnOrder.length && usedColumnIdx.has(nextCol)) nextCol++;
+            if (nextCol >= columnOrder.length) break;
+            this.#outValues[idx] = row[columnOrder[nextCol]];
+            usedColumnIdx.add(nextCol);
+            nextCol++;
+          }
         }
       }
+
+      // Absorb any SQLCA-derived warnings the inner PreparedStatement
+      // folded onto its own chain. The inner statement is about to
+      // close and would drop them otherwise. Graft the entire inner
+      // chain onto our tail in one step — each node already links to
+      // its successor, so iterating would double-link them.
+      const innerWarnings = typeof stmt.getWarnings === 'function'
+        ? stmt.getWarnings()
+        : null;
+      if (innerWarnings) {
+        if (!this.#warnings) this.#warnings = innerWarnings;
+        else this.#warnings.setNextWarning(innerWarnings);
+      }
+
+      this.#resultSets = resultSets;
       this.#executed = true;
 
       // Build legacy `out` array (just the OUT + INOUT slots in order)
       const outArr = [];
-      for (let i = 1; i <= total; i++) {
+      for (let i = 1; i <= totalSlots; i++) {
         const s = this.#slots[i];
         if (s.mode === ParameterMode.out || s.mode === ParameterMode.inOut) {
           outArr.push(this.#outValues[i]);

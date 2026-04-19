@@ -8,10 +8,17 @@ js400 preserves most of the common DB2 capabilities a JTOpen JDBC caller relied 
 
 Some features are still staged or partial — see the [SQL feature matrix](sql-feature-matrix.md) for the current coverage and gap list. Notable items that still diverge from strict JDBC parity:
 
-- full host-server OUT / INOUT decoding for `CallableStatement` (currently uses a result-set fallback)
-- server-side scrollable and updatable result sets (scroll semantics work against materialized rows)
-- generated keys wrapping only supports `INSERT` (UPDATE/DELETE/MERGE is staged)
+- server-side scrollable and updatable result sets (scroll semantics work against materialized rows only; `SCROLL_INSENSITIVE` is supported through in-memory buffering, `SCROLL_SENSITIVE` is not)
+- true wire-level positioned `UPDATE / DELETE` (`WHERE CURRENT OF <cursor>`) now works: `setCursorName()` reaches `CREATE_RPB` using the server CCSID, and live qualification on IBM i confirmed both positioned `UPDATE` and `DELETE`
+- generated-keys wrapping only supports `INSERT` (UPDATE/DELETE/MERGE is staged)
+- mid-RTT preemption for `cancel()` / `setQueryTimeout()` — both are honored client-side (the wrapper throws `SqlError(HY008)` after the in-flight RTT returns), but neither preempts the in-flight execute. Real preemption needs a side connection (JTOpen `AS400JDBCConnectionImpl.cancel`).
 - XA, RowSet, and full JNDI integration are intentionally not ported
+
+Automatic SQLCA-to-warning propagation is active for `Statement` (`query`, `execute(sql)` including the immediate and FINAL-TABLE wrap paths, `executeQuery`, `executeBatch`), `PreparedStatement` (`execute`, `executeForStream`, `executeCall`, `executeBatch`, generated-keys wrap), `CallableStatement` (which absorbs the inner prepared statement's chain), and `Connection` (`execute(sql)` immediate + parameterized prepare paths, `commit`, `rollback`, savepoint lifecycle, and connection-level control statements like `SET SCHEMA` / `SET CURRENT ISOLATION`). Warnings on `Statement` / `PreparedStatement` are cleared at the start of every execute (JTOpen `AS400JDBCStatement.commonExecuteBefore` lifecycle); `Connection` warnings are JDBC-cumulative (only `clearWarnings()` resets).
+
+`cancel()` and `setQueryTimeout()` are wired on every execute path. `cancel()` flips an internal flag; the next operation throws `SqlError(HY008)` "Statement was cancelled" and clears the flag. `setQueryTimeout(n>0)` arms a per-execute `setTimeout(n*1000)` that flips the same flag; after the in-flight RTT returns the wrapper throws `SqlError(HY008)` "Query timeout exceeded". The fast path (`n = 0`) is a single boolean check and does not allocate.
+
+`CallableStatement` has moved out of the partial list: OUT / INOUT values are now decoded at the protocol level from the CALL reply's parameter-row block (code point `0x380E`, gated by the `ORS_BITMAP_RESULT_DATA` bit), matching JTOpen's `parameterRow_` path. JDBC call-text forms `{ call PROC(?,?) }`, `{ ? = call FUNC(?,?) }`, and bare `CALL PROC(?,?)` all parse and classify as CALL end-to-end. A deterministic result-set heuristic remains as a fallback for procedures that emit OUT through `VALUES(...)` instead of real markers.
 
 ## JDBC URL migration
 
@@ -112,8 +119,20 @@ console.log(opts);
 | `time separator` | `timeSeparator` | `:`, `.`, `,`, ` ` |
 | `transaction isolation` | `isolation` | `none`, `read-uncommitted`, `read-committed`, `repeatable-read`, `serializable` |
 | `auto commit` | `autoCommit` | `true` or `false` |
-| `block size` | `blockSize` | Fetch block size (0-512) |
-| `prefetch` | `prefetch` | Prefetch result rows |
+| `hold statements` | `holdStatements` | Boolean (or byte). When true, emits `HOLD_INDICATOR=0x01` on `CREATE RPB` so cursors survive `COMMIT`. Unset leaves DB2 on its default. |
+
+### P1: Runtime-wired or stored-only knobs
+
+Some properties are now runtime-wired; others are still accepted only for configuration round-trip. The important distinction is explicit opt-in: js400 only changes runtime behavior when the caller actually set the property, not when a library default happens to exist in normalized options.
+
+| JDBC property | js400 option | Notes |
+| --- | --- | --- |
+| `block size` | `blockSize` | Runtime-wired when explicitly set. js400 now computes a JTOpen-style row-count blocking factor from row length (`floor(blockSizeKB * 1024 / rowLength)`, capped to `32767`) and uses that for the OPEN request plus the default FETCH size when the caller did not set `Statement.setFetchSize()`. The knob remains opt-in only; default callers keep js400's existing fetch behavior. Live a live IBM i host qualification showed `blockSize=32` was materially slower on the current wide-row benchmark, so this is parity behavior, not a recommended default. |
+| `prefetch` | `prefetch` | Stored only. js400 currently uses the correctness-first `OPEN_AND_DESCRIBE` + `FETCH` path by default; inline first-block prefetch via `OPEN_DESCRIBE_FETCH` is deferred until it is re-qualified against live hosts. |
+| `extended dynamic` | `extendedDynamic` | Stored only. No server-side SQL package integration yet. |
+| `lazy close` | `lazyClose` | Stored only. Handles already defer via the statement cache; no wire-level lazy close yet. |
+| `package cache` | `packageCache` | Stored only. |
+| `query timeout mechanism` | `queryTimeoutMechanism` | Stored only. `setQueryTimeout()` itself is wired client-side (throws `SqlError(HY008)` after the in-flight RTT when the timer fires) — no server RPB timeout, no mid-RTT preemption. The mechanism property still doesn't switch between `QQRYTIMLMT` and the cancel-thread strategies; that selection is a JTOpen-only concept today. |
 
 ### P1: Considered
 
@@ -127,7 +146,6 @@ console.log(opts);
 | `block criteria` | `blockCriteria` | Block fetch criteria |
 | `package` | `sqlPackage` | SQL package name |
 | `package library` | `packageLibrary` | Package library |
-| `package cache` | `packageCache` | Enable package caching |
 
 ### Dropped (Java-only)
 
@@ -141,11 +159,13 @@ These JDBC properties have no meaning in a JavaScript client:
 - `access` -- Java security manager access level
 - `remarks` -- JDBC metadata remarks source
 - `data compression` -- Connection-level compression
-- `extended dynamic` -- Java statement caching mode
 - `full open` -- Java cursor mode
-- `lazy close` -- Java statement close timing
 - `lob threshold` -- Java LOB inline threshold
 - `maximum precision` / `maximum scale` -- Java decimal limits
 - All JNDI/DataSource bean properties
+
+(`extended dynamic` and `lazy close` are not dropped — they are
+accepted as stored-only properties today and are candidates for a
+future runtime-knob pass; see the P1 table above.)
 
 Source: [`src/db/connect.js`](../src/db/connect.js), [`src/db/url.js`](../src/db/url.js), [`src/db/properties.js`](../src/db/properties.js)

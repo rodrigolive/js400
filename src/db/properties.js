@@ -120,7 +120,15 @@ const KNOWN_PROPERTIES = new Set([
   'blockSize', 'prefetch', 'lazyClose', 'translateBinary', 'trueAutoCommit',
   'sortType', 'sortLanguage', 'sortTable', 'sortWeight', 'sortSequence',
   'host', 'port', 'user', 'password', 'secure', 'protocol',
-  'sqlPackage', 'packageLibrary', 'packageCache',
+  // SQL package / extended-dynamic knobs — threaded through to the
+  // engine's PackageManager. `extendedDynamic` gates the feature,
+  // `sqlPackage` / `packageLibrary` identify the server-side package,
+  // `packageCache` controls the optional RETURN_PACKAGE fetch, and
+  // `packageError` selects the failure-handling policy (none/
+  // warning/exception). `holdStatements` controls cursor hold across
+  // commit.
+  'extendedDynamic', 'sqlPackage', 'packageLibrary', 'packageCache', 'packageError',
+  'translateHex', 'holdStatements',
   'blockCriteria',
 ]);
 
@@ -131,6 +139,12 @@ const VALID_TIME_FORMATS = new Set(['*ISO', '*USA', '*EUR', '*JIS', '*HMS']);
 const VALID_ISOLATION = new Set([
   'none', 'read-uncommitted', 'read-committed', 'repeatable-read', 'serializable',
 ]);
+/**
+ * JTOpen `packageError` values — mirrors JDProperties.PACKAGE_ERROR
+ * choices. Anything else is coerced to 'warning' at the engine
+ * layer; we still validate here so a typo surfaces loudly.
+ */
+const VALID_PACKAGE_ERROR = new Set(['none', 'warning', 'exception']);
 
 /**
  * Validate connection properties. Throws on invalid values.
@@ -171,6 +185,13 @@ export function validateProperties(props) {
     if (typeof bs !== 'number' || bs < 0 || bs > 512) {
       throw new Error(`Invalid blockSize: ${bs}. Expected 0-512.`);
     }
+  }
+
+  if (props.packageError !== undefined
+    && !VALID_PACKAGE_ERROR.has(String(props.packageError).toLowerCase())) {
+    throw new Error(
+      `Invalid packageError: "${props.packageError}". Expected one of: ${[...VALID_PACKAGE_ERROR].join(', ')}`,
+    );
   }
 
   return warnings;

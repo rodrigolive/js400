@@ -216,6 +216,11 @@ export class Connection {
         sql,
         explicitCursor ? { cursorName: opts.cursorName } : undefined,
       );
+      // If the engine's PackageManager queued a `packageError='warning'`
+      // diagnostic during lazy CREATE_PACKAGE, graft it now so
+      // callers see it via `Connection.getWarnings()` before they
+      // run the prepared statement.
+      this.#drainPackageWarning();
     }
 
     // Hand the PreparedStatement a release-back-to-cache hook. If
@@ -670,7 +675,19 @@ export class Connection {
   async #executeImmediateWithWarning(sql) {
     const result = await this.#dbConnection.executeImmediate(sql);
     this.#propagateResultWarning(result);
+    this.#drainPackageWarning();
     return result;
+  }
+
+  /**
+   * Pull any SQL-package warning the engine queued and graft it onto
+   * the connection's JDBC-style cumulative chain. Cheap no-op when
+   * `packageError` is 'none' or 'exception', or when the manager is
+   * disabled — `drainPackageWarning` returns null in those cases.
+   */
+  #drainPackageWarning() {
+    const w = this.#dbConnection.drainPackageWarning?.();
+    if (w) this.addWarning(w);
   }
 
   // --- Pool integration ---

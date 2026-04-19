@@ -119,26 +119,30 @@ describe('SortSequence', () => {
 });
 
 describe('PackageManager', () => {
-  test('default package name', () => {
+  // Note: the package-manager surface was rewritten to mirror
+  // JTOpen `JDPackageManager` (enable/disable rules, JTOpen-shape
+  // suffix, SqlPackage rpbId, `packageError` policy, etc.). The
+  // comprehensive tests for the new API live in
+  // `tests/12-sql-api/package-manager.test.js`. The two smoke
+  // checks below verify the basic shape so a future PM refactor
+  // that breaks both suites surfaces here too.
+
+  test('default constructor is disabled (extendedDynamic off)', () => {
     const pm = new PackageManager();
-    expect(pm.defaultPackage).toBe('QSYS2/QSQJRN');
+    expect(pm.isEnabled()).toBe(false);
+    expect(pm.getName()).toBeNull();
+    expect(pm.isPackaged('SELECT * FROM T WHERE X = ?')).toBe(false);
   });
 
-  test('register, get, and remove package', () => {
-    const pm = new PackageManager();
-    pm.registerPackage('PKG1', { id: 1 });
-    expect(pm.getPackage('PKG1')).toEqual({ id: 1 });
-    pm.removePackage('PKG1');
-    expect(pm.getPackage('PKG1')).toBeNull();
-  });
-
-  test('clear removes all packages', () => {
-    const pm = new PackageManager();
-    pm.registerPackage('A', {});
-    pm.registerPackage('B', {});
-    pm.clear();
-    expect(pm.getPackage('A')).toBeNull();
-    expect(pm.getPackage('B')).toBeNull();
+  test('enabling requires extendedDynamic + packageName', () => {
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'PKG1',
+      packageLibrary: 'MYLIB',
+    });
+    expect(pm.isEnabled()).toBe(true);
+    expect(pm.getName().startsWith('PKG1')).toBe(true);
+    expect(pm.getLibraryName()).toBe('MYLIB');
   });
 });
 

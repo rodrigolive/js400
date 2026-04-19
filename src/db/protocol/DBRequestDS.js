@@ -98,6 +98,13 @@ export const CodePoint = Object.freeze({
   LOB_LOCATOR_HANDLE:          0x3818,
   REQUESTED_SIZE:              0x3819,
   START_OFFSET:                0x381A,
+  /**
+   * JOB_IDENTIFIER (0x3826) — server job string used to target a
+   * FUNCTIONID_CANCEL on the side-channel connection. JTOpen
+   * `DBSQLRequestDS.setJobIdentifier`; server stores the 26-char
+   * identifier in the job/user/id triple.
+   */
+  JOB_IDENTIFIER:              0x3826,
   EXTENDED_COLUMN_DESC_OPTION: 0x3829,
   EXTENDED_SQL_STATEMENT_TEXT: 0x3831,
   RLE_COMPRESSED_DATA:         0x3832,
@@ -310,6 +317,19 @@ function buildRawCP(cp, data) {
 }
 
 /**
+ * Build an empty code point (length-only, no value). JTOpen uses this
+ * shape when a property is "present but unset" — e.g. `setPackageName(null)`
+ * which tells the server to drop the current RPB's package binding for
+ * a single prepare even though the connection itself is package-bound.
+ */
+function buildEmptyCP(cp) {
+  const buf = Buffer.alloc(6);
+  buf.writeInt32BE(6, 0);
+  buf.writeUInt16BE(cp, 4);
+  return buf;
+}
+
+/**
  * Write the standard 20-byte database request template.
  *
  * Layout (per JTOpen DBBaseRequestDS.java & jtopenlite DatabaseConnection):
@@ -474,6 +494,125 @@ export class DBRequestDS {
   }
 
   /**
+   * Build a CANCEL (0x1818) request.
+   *
+   * Sent on a dedicated side-channel database connection so a cancel
+   * request doesn't deadlock behind an in-flight execute on the
+   * primary connection. Mirrors JTOpen `AS400JDBCConnectionImpl.cancel`:
+   * the template's RPB handle is the CONNECTION id (`id_` in JTOpen)
+   * of the *target* connection whose statement should be interrupted,
+   * and the code points carry the server job identifier (JTOpen
+   * `DBSQLRequestDS.setJobIdentifier`, code point 0x3826) so the
+   * server can route the cancel to the correct job.
+   *
+   * Callers must pass `jobIdentifier` (the 26-char server job string
+   * captured from the exchange-attributes reply). Without it the
+   * cancel is an all-connections operation which js400 explicitly
+   * refuses; the caller should fall back to post-RTT HY008 instead.
+   *
+   * @param {object} opts
+   * @param {number} opts.rpbId — connection-scoped RPB handle for the
+   *   target connection (NOT the target statement's RPB).
+   * @param {string} opts.jobIdentifier — 26-char job/user/id string.
+   * @param {number} [opts.identifierCcsid=13488]
+   * @returns {Buffer}
+   */
+  static buildCancel(opts) {
+    if (typeof opts.jobIdentifier !== 'string' || opts.jobIdentifier.length === 0) {
+      throw new Error('buildCancel requires a jobIdentifier');
+    }
+    const identifierCcsid = opts.identifierCcsid ?? UNICODE_CCSID;
+    const cps = [
+      buildTextCP(CodePoint.JOB_IDENTIFIER, opts.jobIdentifier, identifierCcsid),
+    ];
+
+    const template = Buffer.alloc(TEMPLATE_LENGTH);
+    writeTemplate(template, 0, {
+      // `SEND_REPLY_IMMED` alone mirrors JTOpen's
+      // ORS_BITMAP_RETURN_DATA for cancel — no SQLCA is needed, the
+      // server returns only the reply template.
+      orsBitmap: ORSBitmap.SEND_REPLY_IMMED,
+      rpbId: opts.rpbId ?? 0,
+      paramCount: cps.length,
+    });
+
+    return assemblePacket(RequestID.CANCEL, TEMPLATE_LENGTH, template, cps);
+  }
+
+  /**
+   * Build a CREATE PACKAGE (0x180F) request.
+   *
+   * Used when `extendedDynamic` is on to materialize a server-side
+   * SQL package into which subsequent PREPARE requests will deposit
+   * their access plans. Mirrors JTOpen `JDPackageManager.create`:
+   * sends `PACKAGE_NAME` (0x3804) + `LIBRARY_NAME` (0x3801), asks for
+   * SQLCA back, and lets the caller interpret SQLCODE -601 ("already
+   * exists") as a success case.
+   *
+   * @param {object} opts
+   * @param {number} opts.rpbId — RPB to tie the request to
+   * @param {string} opts.packageName — normalized 10-char name
+   * @param {string} opts.packageLibrary — uppercased library; JTOpen
+   *   defaults to `QGPL`
+   * @param {number} [opts.identifierCcsid=13488]
+   * @returns {Buffer}
+   */
+  static buildCreatePackage(opts) {
+    const identifierCcsid = opts.identifierCcsid ?? UNICODE_CCSID;
+    const cps = [
+      buildTextCP(CodePoint.PACKAGE_NAME, opts.packageName, identifierCcsid),
+      buildTextCP(CodePoint.LIBRARY_NAME, opts.packageLibrary, identifierCcsid),
+    ];
+
+    const template = Buffer.alloc(TEMPLATE_LENGTH);
+    writeTemplate(template, 0, {
+      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA,
+      rpbId: opts.rpbId ?? 0,
+      paramCount: cps.length,
+    });
+
+    return assemblePacket(RequestID.CREATE_PACKAGE, TEMPLATE_LENGTH, template, cps);
+  }
+
+  /**
+   * Build a RETURN PACKAGE (0x1815) request.
+   *
+   * Pulls down the current contents of a server-side SQL package so
+   * the client can reuse packaged statement names at prepare time.
+   * Mirrors JTOpen `JDPackageManager.cache`: PACKAGE_NAME +
+   * LIBRARY_NAME + RETURN_SIZE (0x3815) of 0, with
+   * `ORSBitmap.PACKAGE_INFORMATION` added to the ORS so the reply
+   * contains the package blob.
+   *
+   * @param {object} opts
+   * @param {number} opts.rpbId
+   * @param {string} opts.packageName
+   * @param {string} opts.packageLibrary
+   * @param {number} [opts.returnSize=0]
+   * @param {number} [opts.identifierCcsid=13488]
+   * @returns {Buffer}
+   */
+  static buildReturnPackage(opts) {
+    const identifierCcsid = opts.identifierCcsid ?? UNICODE_CCSID;
+    const cps = [
+      buildTextCP(CodePoint.PACKAGE_NAME, opts.packageName, identifierCcsid),
+      buildTextCP(CodePoint.LIBRARY_NAME, opts.packageLibrary, identifierCcsid),
+      buildIntCP(CodePoint.RETURN_SIZE, opts.returnSize ?? 0),
+    ];
+
+    const template = Buffer.alloc(TEMPLATE_LENGTH);
+    writeTemplate(template, 0, {
+      orsBitmap: ORSBitmap.SEND_REPLY_IMMED
+        | ORSBitmap.SQLCA
+        | ORSBitmap.PACKAGE_INFORMATION,
+      rpbId: opts.rpbId ?? 0,
+      paramCount: cps.length,
+    });
+
+    return assemblePacket(RequestID.RETURN_PACKAGE, TEMPLATE_LENGTH, template, cps);
+  }
+
+  /**
    * Build prepare statement request.
    * @param {object} opts
    * @param {number} opts.rpbId
@@ -525,11 +664,12 @@ export class DBRequestDS {
    */
   static buildPrepareAndDescribe(opts) {
     const cps = [];
+    const identifierCcsid = opts.identifierCcsid ?? UNICODE_CCSID;
     if (opts.statementName) {
       cps.push(buildTextCP(
         CodePoint.PREPARED_STATEMENT_NAME,
         opts.statementName,
-        opts.identifierCcsid ?? UNICODE_CCSID,
+        identifierCcsid,
       ));
     }
     cps.push(buildExtTextCP(CodePoint.EXTENDED_SQL_STATEMENT_TEXT, opts.sqlText));
@@ -538,6 +678,23 @@ export class DBRequestDS {
     if (opts.openAttributes != null) cps.push(buildByteCP(CodePoint.OPEN_ATTRIBUTES, opts.openAttributes));
     if (opts.describeOption != null) cps.push(buildByteCP(CodePoint.DESCRIBE_OPTION, opts.describeOption));
     if (opts.extendedColumnDescriptorOption != null) cps.push(buildByteCP(CodePoint.EXTENDED_COLUMN_DESC_OPTION, opts.extendedColumnDescriptorOption));
+    // Extended-dynamic package binding: when a caller asks us to store
+    // this statement in a server-side SQL package, attach the package
+    // + library codepoints to the PREPARE request. JTOpen sends these
+    // from AS400JDBCStatement#commonPrepare via
+    // `setPackageName`/`setLibraryName` whenever packageManager is
+    // enabled AND the statement is packageable. A null packageName
+    // sends the "empty" CP, which is how JTOpen tells the server
+    // "this specific statement is not eligible for the package" even
+    // though the RPB's library is still bound.
+    if (opts.packageName === null) {
+      cps.push(buildEmptyCP(CodePoint.PACKAGE_NAME));
+    } else if (typeof opts.packageName === 'string' && opts.packageName.length > 0) {
+      cps.push(buildTextCP(CodePoint.PACKAGE_NAME, opts.packageName, identifierCcsid));
+    }
+    if (typeof opts.libraryName === 'string' && opts.libraryName.length > 0) {
+      cps.push(buildTextCP(CodePoint.LIBRARY_NAME, opts.libraryName, identifierCcsid));
+    }
     if (opts.translateIndicator != null) cps.push(buildByteCP(CodePoint.TRANSLATE_INDICATOR, opts.translateIndicator));
 
     let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT;
@@ -890,14 +1047,38 @@ export class DBRequestDS {
 
   /**
    * Build execute-immediate request (prepare + execute in one step).
+   *
+   * Mirrors JTOpen `AS400JDBCStatement` immediate-execute path,
+   * which also attaches PACKAGE_NAME / LIBRARY_NAME / PREPARE_OPTION
+   * when the connection's package manager is enabled. Passing
+   * `packageName: null` emits the empty PACKAGE_NAME codepoint that
+   * JTOpen uses to tell the server "this statement is not eligible
+   * for the package, but the connection IS package-bound".
+   *
    * @param {object} opts
    * @param {number} opts.rpbId
    * @param {string} opts.sqlText
+   * @param {number} [opts.statementType]
+   * @param {number} [opts.prepareOption]
+   * @param {string|null} [opts.packageName]
+   * @param {string} [opts.libraryName]
+   * @param {number} [opts.identifierCcsid]
    * @param {number} [opts.translateIndicator]
    * @returns {Buffer}
    */
   static buildExecuteImmediate(opts) {
+    const identifierCcsid = opts.identifierCcsid ?? UNICODE_CCSID;
     const cps = [buildTextCP(CodePoint.SQL_STATEMENT_TEXT, opts.sqlText)];
+    if (opts.statementType != null) cps.push(buildShortCP(CodePoint.STATEMENT_TYPE, opts.statementType));
+    if (opts.prepareOption != null) cps.push(buildByteCP(CodePoint.PREPARE_OPTION, opts.prepareOption));
+    if (opts.packageName === null) {
+      cps.push(buildEmptyCP(CodePoint.PACKAGE_NAME));
+    } else if (typeof opts.packageName === 'string' && opts.packageName.length > 0) {
+      cps.push(buildTextCP(CodePoint.PACKAGE_NAME, opts.packageName, identifierCcsid));
+    }
+    if (typeof opts.libraryName === 'string' && opts.libraryName.length > 0) {
+      cps.push(buildTextCP(CodePoint.LIBRARY_NAME, opts.libraryName, identifierCcsid));
+    }
     if (opts.translateIndicator != null) cps.push(buildByteCP(CodePoint.TRANSLATE_INDICATOR, opts.translateIndicator));
 
     const template = Buffer.alloc(TEMPLATE_LENGTH);

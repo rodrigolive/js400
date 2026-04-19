@@ -379,10 +379,26 @@ describe('Performance-knob plumbing (extendedDynamic / packageCache)', () => {
 
   test('resetMetrics() also zeros the package-* counters', async () => {
     const { StatementManager } = await import('../../src/db/engine/StatementManager.js');
-    const sm = new StatementManager({ async sendAndReceive() {} }, { registerCursor() {} }, {});
-    sm.metrics.packageHits = 3;
-    sm.metrics.packageCreates = 1;
-    sm.metrics.packageFetches = 2;
+    const { PackageManager } = await import('../../src/db/engine/PackageManager.js');
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'JS400PKG',
+      packageLibrary: 'QGPL',
+    });
+    const sm = new StatementManager({ async sendAndReceive() {} }, { registerCursor() {} }, {
+      packageManager: pm,
+    });
+    // Counters belong to the PackageManager now (single source of
+    // truth); StatementManager.metrics exposes read-through getters.
+    pm.recordHit();
+    pm.recordHit();
+    pm.recordHit();
+    pm.markCreated();
+    pm.setCachedRaw(Buffer.from([0]), 0);
+    pm.setCachedRaw(Buffer.from([0]), 0);
+    expect(sm.metrics.packageHits).toBe(3);
+    expect(sm.metrics.packageCreates).toBe(1);
+    expect(sm.metrics.packageFetches).toBe(2);
     sm.resetMetrics();
     expect(sm.metrics.packageHits).toBe(0);
     expect(sm.metrics.packageCreates).toBe(0);

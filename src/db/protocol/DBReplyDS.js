@@ -362,12 +362,50 @@ export function parseExchangeAttributes(buf) {
   let serverCCSID = 37;
   let serverDatastreamLevel = 0;
   let serverAttributes = 0;
+  let serverFunctionalLevel = 0;
+  let serverJobIdentifier = null;
 
-  // Check for 0x3804 code point (server attributes from SET_SERVER_ATTRIBUTES)
+  // Check for 0x3804 code point (server attributes from SET_SERVER_ATTRIBUTES).
+  //
+  // Layout (per JTOpen DBReplyServerAttributes):
+  //   +0   short  serverAttributes  (16-bit flags)
+  //   +21  short  serverCCSID       (16-bit code page)
+  //   +50  char(10) serverFunctionalLevel — decimal level string in
+  //        server CCSID; "0000000005" is level 5 (FUNCTIONID_CANCEL
+  //        supported). We parse the trailing digits.
+  //   +88  char(26) serverJobIdentifier — 26-byte job identifier
+  //        string in server CCSID (job name + user + number blocks)
+  //        used as the target of FUNCTIONID_CANCEL on a side channel.
   const attrData = getCodePointData(reply, REPLY_CP.SERVER_ATTRIBUTES);
   if (attrData && attrData.length >= 23) {
     serverCCSID = attrData.readUInt16BE(21);
     serverAttributes = attrData.readUInt16BE(0);
+  }
+  if (attrData && attrData.length >= 60) {
+    // Decode the functional-level string from the server CCSID. We
+    // don't require a CharConverter here — the functional level is
+    // always pure ASCII digits in every known CCSID, so a
+    // byte-wise decode-to-ASCII is correct and cheap.
+    const fl = attrData.subarray(50, 60);
+    let parsed = 0;
+    for (let i = 0; i < fl.length; i++) {
+      const b = fl[i];
+      // Accept ASCII digits.
+      if (b >= 0x30 && b <= 0x39) parsed = parsed * 10 + (b - 0x30);
+      // Accept EBCDIC F0-F9 digits (most common job CCSIDs).
+      else if (b >= 0xF0 && b <= 0xF9) parsed = parsed * 10 + (b - 0xF0);
+      // Non-digit → treat as padding and break.
+      else if (b === 0 || b === 0x40 /* EBCDIC space */ || b === 0x20) {
+        if (parsed > 0) break;
+      } else break;
+    }
+    serverFunctionalLevel = parsed;
+  }
+  if (attrData && attrData.length >= 88 + 26) {
+    // Keep the job id as raw bytes; the caller needs to decode it
+    // using the server CCSID we just extracted. Stashing raw bytes
+    // here avoids pulling CharConverter into the DBReplyDS module.
+    serverJobIdentifier = Buffer.from(attrData.subarray(88, 88 + 26));
   }
 
   // Check for CLIENT_DATASTREAM_LEVEL reply (0x3A01)
@@ -382,6 +420,8 @@ export function parseExchangeAttributes(buf) {
     serverAttributes,
     serverCCSID,
     serverDatastreamLevel,
+    serverFunctionalLevel,
+    serverJobIdentifier,
     accessLevel: 0,
     header: reply.header,
     codePoints: reply.codePoints,

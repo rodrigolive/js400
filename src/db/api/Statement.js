@@ -387,13 +387,15 @@ export class Statement {
   getMaxFieldSize()    { return this.#maxFieldSize; }
   // queryTimeout is honored by `#runWithCancellation()`: positive
   // values arm a per-execute `setTimeout(n*1000)` that flips
-  // `#cancelled`; the wrapper throws `SqlError(HY008)` after the
-  // in-flight RTT returns. The fast path (n = 0) takes a single
-  // boolean check and does not allocate. No server-side RPB timeout
-  // is sent and no mid-RTT preemption is performed — that needs a
-  // side connection (JTOpen `AS400JDBCConnectionImpl.cancel`) and is
-  // explicitly tracked as the remaining gap in
-  // docs/sql-feature-matrix.md and .agent/DB2-GAP-VERIFY.md.
+  // `#cancelled` AND fires `DbConnection.cancel()` on the side
+  // channel (JTOpen `AS400JDBCConnectionImpl.cancel` pattern —
+  // FUNCTIONID_CANCEL 0x1818 on a second DATABASE connection
+  // targeting the server job identifier). The wrapper throws
+  // `SqlError(HY008)` after the in-flight RTT returns; when the
+  // side channel succeeds the RTT returns early with an interrupted
+  // SQLCA, so the throw is near-simultaneous rather than pinned to
+  // the natural RTT finish time. Fast path (n = 0) takes a single
+  // boolean check and does not allocate.
   setQueryTimeout(n)   { this.#queryTimeout = Math.max(0, n | 0); }
   getQueryTimeout()    { return this.#queryTimeout; }
   setEscapeProcessing(v){ this.#escapeProcessing = Boolean(v); }
@@ -408,28 +410,47 @@ export class Statement {
   getResultSetHoldability() { return this.#holdability; }
 
   /**
-   * Mark the statement as cancelled. The next operation will throw
-   * `SqlError(HY008)`. Client-side only — js400 does not yet send a
-   * protocol-level cancel (JTOpen sends `FUNCTIONID_CANCEL` 0x1818
-   * via `connection_.cancel(id_)`); a real wire cancel needs a side
-   * connection. Calling `cancel()` while no execute is in flight
-   * still affects the next execute.
+   * Mark the statement as cancelled.
+   *
+   * Fires `DbConnection.cancel()` on the side-channel to attempt a
+   * real wire-level `FUNCTIONID_CANCEL` against the target job. The
+   * local `#cancelled` flag is ALSO set so the `#runWithCancellation`
+   * post-check still throws `HY008` even if the side channel isn't
+   * reachable (graceful degradation to the prior client-side-only
+   * behavior). Calling `cancel()` while no execute is in flight
+   * still arms the flag, so the NEXT execute will throw.
+   *
+   * Mirrors JTOpen `AS400JDBCStatement.cancel` which calls
+   * `connection_.cancel(id_)` on a separate connection.
    */
-  cancel() { this.#cancelled = true; }
+  cancel() {
+    this.#cancelled = true;
+    // Fire-and-forget the wire cancel. We intentionally don't await
+    // — the primary execute is blocked on its own sendAndReceive,
+    // and the side channel has its own socket. Any failure bumps
+    // `cancelMetrics.cancelFallbacks`; the post-RTT HY008 path
+    // still fires regardless.
+    const db = this.#dbConnection;
+    if (db && typeof db.cancel === 'function') {
+      db.cancel().catch(() => { /* fallback covered by flag */ });
+    }
+  }
   /** @returns {boolean} */
   isCancelled() { return this.#cancelled; }
 
   /**
-   * Cancel-and-timeout wrapper. Mirrors the helper in
-   * `PreparedStatement` (see that file for the design rationale).
+   * Cancel-and-timeout wrapper. Fast path is a single boolean check
+   * when `queryTimeout === 0` and no cancel is pending.
    *
    *   - `queryTimeout = 0` and not cancelled → fast path: 1 boolean
-   *     check + the wrapped invocation. No timer. No allocation.
+   *     check + the wrapped invocation. No timer, no side-channel
+   *     chatter, no allocation.
    *   - cancelled before invocation → throw HY008 immediately, clear.
-   *   - `queryTimeout > 0` → arm a `setTimeout` that flips
-   *     `#cancelled`; the engine call still runs to completion (no
-   *     side channel to inject `FUNCTIONID_CANCEL` mid-RTT) but the
-   *     post-check throws HY008 so the next caller sees the timeout.
+   *   - `queryTimeout > 0` → arm a `setTimeout` that, on expiry,
+   *     fires `DbConnection.cancel()` to try a mid-RTT wire cancel
+   *     AND sets `#cancelled`. If the side channel succeeds the
+   *     server returns an interrupted SQLCA early; either way the
+   *     post-check throws `HY008`.
    *
    * @template T
    * @param {() => Promise<T>} invoke
@@ -449,10 +470,16 @@ export class Statement {
     let invokeError = null;
     let result;
     try {
-      timer = setTimeout(
-        () => { this.#cancelled = true; },
-        this.#queryTimeout * 1000,
-      );
+      timer = setTimeout(() => {
+        this.#cancelled = true;
+        // Best-effort side-channel cancel. If it succeeds the
+        // in-flight RTT returns earlier; if it fails the post-check
+        // below still throws HY008.
+        const db = this.#dbConnection;
+        if (db && typeof db.cancel === 'function') {
+          db.cancel().catch(() => { /* fallback covered by flag */ });
+        }
+      }, this.#queryTimeout * 1000);
       result = await invoke();
     } catch (e) {
       invokeError = e;

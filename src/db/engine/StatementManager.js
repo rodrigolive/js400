@@ -159,6 +159,18 @@ function nextRpbId() {
   return rpbCounter;
 }
 
+/**
+ * Exposed for callers (e.g. `DbConnection`) that need to reserve a
+ * connection-level RPB id for operations that are NOT tied to a
+ * specific prepared statement. Most notably the SQL package manager,
+ * which mirrors JTOpen's `JDPackageManager` using the connection's
+ * stable `id_` for CREATE_PACKAGE / RETURN_PACKAGE instead of borrowing
+ * an in-flight prepare's handle.
+ */
+export function reserveConnectionRpbId() {
+  return nextRpbId();
+}
+
 /** Generate a unique prepared statement name for the server. */
 function generateStatementName(rpbId) {
   return `STM${rpbId}`;
@@ -174,12 +186,18 @@ export class StatementManager {
   #serverCCSID;
   #cursorManager;
   #statements;
+  #packageManager;
 
   constructor(connection, cursorManager, opts = {}) {
     this.#connection = connection;
     this.#serverCCSID = opts.serverCCSID ?? 37;
     this.#cursorManager = cursorManager;
     this.#statements = new Map();
+    // PackageManager is a null reference until DbConnection wires one
+    // in. Keeping it optional lets StatementManager stay testable in
+    // isolation — tests that don't care about packages construct the
+    // manager without a package reference.
+    this.#packageManager = opts.packageManager ?? null;
     // JTOpen `holdStatements` → DB2 HOLD_INDICATOR (0x380F). When true,
     // prepared statements / cursors survive COMMIT so the cache isn't
     // invalidated on every transaction boundary. `null` leaves the
@@ -203,19 +221,31 @@ export class StatementManager {
     // Lightweight protocol-activity counters. Zero cost when unread.
     // Exposed via `metrics`; reset via `resetMetrics()`. Used by the
     // live benchmark to tie performance changes to real protocol
-    // behavior (e.g., did a knob halve the fetch RTT count?). The
-    // package* counters stay 0 until the next pass actually wires
-    // server-side SQL package interactions; surfacing them now means
-    // the bench harness doesn't change shape when that lands.
-    this.metrics = {
+    // behavior (e.g., did a knob halve the fetch RTT count?).
+    //
+    // The package* counters live on the PackageManager itself so that
+    // a single object owns the truth; we expose read-through getters
+    // here so the bench harness and existing tests can keep reading
+    // `statementManager.metrics.packageHits` unchanged.
+    this.metrics = Object.defineProperties({
       prepareCalls: 0,        // StatementManager.prepareStatement
       executeCalls: 0,        // StatementManager.execute (inc. SELECT/DML/CALL)
       batchCalls: 0,          // StatementManager.executeBatch chunks
       closeStatementCalls: 0, // StatementManager.closeStatement
-      packageHits: 0,         // statement found in server-side SQL package
-      packageCreates: 0,      // statement added to server-side SQL package
-      packageFetches: 0,      // server-side SQL package round-trip
-    };
+    }, {
+      packageHits: {
+        enumerable: true,
+        get: () => this.#packageManager?.metrics.packageHits ?? 0,
+      },
+      packageCreates: {
+        enumerable: true,
+        get: () => this.#packageManager?.metrics.packageCreates ?? 0,
+      },
+      packageFetches: {
+        enumerable: true,
+        get: () => this.#packageManager?.metrics.packageFetches ?? 0,
+      },
+    });
   }
 
   resetMetrics() {
@@ -223,9 +253,12 @@ export class StatementManager {
     this.metrics.executeCalls = 0;
     this.metrics.batchCalls = 0;
     this.metrics.closeStatementCalls = 0;
-    this.metrics.packageHits = 0;
-    this.metrics.packageCreates = 0;
-    this.metrics.packageFetches = 0;
+    if (this.#packageManager) {
+      const m = this.#packageManager.metrics;
+      m.packageHits = 0;
+      m.packageCreates = 0;
+      m.packageFetches = 0;
+    }
   }
 
   /**
@@ -259,6 +292,20 @@ export class StatementManager {
     const statementType = inferStatementType(sql);
     const openAttributes = getOpenAttributesForSql(sql);
 
+    // SQL package lazy-create. When `extendedDynamic` is on and the
+    // user supplied a package name, we materialize the server-side
+    // package once per connection (JTOpen does the same in
+    // AS400JDBCStatement.commonPrepare: `if (!packageManager_.isCreated())
+    // packageManager_.create()`). Failure flips the manager to
+    // disabled and — depending on the `packageError` policy —
+    // either throws, queues a connection warning, or stays silent;
+    // in all non-throwing cases the prepare itself proceeds on the
+    // normal (packageless) path, matching JTOpen.
+    const pkg = this.#packageManager;
+    if (pkg && pkg.isEnabled() && !pkg.isCreated()) {
+      await this.#ensurePackageCreated(pkg);
+    }
+
     // Create RPB with cursor name + statement name (per jtopenlite).
     // Thread the connection-level HOLD_INDICATOR when the user asked
     // for holdStatements=true, so cursors survive COMMIT without a
@@ -275,6 +322,27 @@ export class StatementManager {
     const createReply = parseOperationReply(createReplyBuf, { serverCCSID: this.#serverCCSID });
     throwIfError(createReply.sqlca, 'Create RPB');
 
+    // Resolve extended-dynamic package binding for this specific
+    // prepare. When the manager is enabled AND the statement is
+    // packageable, JTOpen sends both PACKAGE_NAME (0x3804) and
+    // LIBRARY_NAME (0x3801) alongside a prepareOption=1 ("enhanced"
+    // prepare, which hints that the server may look up / store a
+    // cached plan in the package). When the manager is enabled but
+    // THIS statement is unpackageable, JTOpen sends an empty
+    // PACKAGE_NAME codepoint; we mirror that with `packageName: null`.
+    let packageName;
+    let libraryName;
+    let prepareOption = 0;
+    if (pkg && pkg.isEnabled()) {
+      libraryName = pkg.getLibraryName();
+      if (pkg.isPackaged(sql)) {
+        packageName = pkg.getName();
+        prepareOption = 1;
+      } else {
+        packageName = null;
+      }
+    }
+
     // Prepare and describe with all required attributes (per jtopenlite)
     const prepBuf = DBRequestDS.buildPrepareAndDescribe({
       rpbId,
@@ -282,10 +350,12 @@ export class StatementManager {
       statementName,
       identifierCcsid: this.#serverCCSID,
       statementType,
-      prepareOption: 0,
+      prepareOption,
       openAttributes,
       extendedColumnDescriptorOption: 0xF1,
       parameterMarkerFormat: true,
+      packageName,
+      libraryName,
     });
     const prepReplyBuf = await this.#connection.sendAndReceive(prepBuf);
     const prepReply = parseOperationReply(prepReplyBuf, { serverCCSID: this.#serverCCSID });
@@ -804,7 +874,44 @@ export class StatementManager {
    */
   async executeImmediate(sql) {
     const rpbId = 0;
-    const reqBuf = DBRequestDS.buildExecuteImmediate({ rpbId, sqlText: sql });
+
+    // Lazy CREATE_PACKAGE on the immediate path too. JTOpen attaches
+    // package codepoints to FUNCTIONID_EXECUTE_IMMEDIATE in
+    // `AS400JDBCStatement.commonPrepare` → immediate branch when the
+    // package manager is enabled, so the server can stash
+    // packageable statements that arrive via executeImmediate as
+    // well as prepareStatement. Without this hook, the two entry
+    // points would disagree on package state.
+    const pkg = this.#packageManager;
+    if (pkg && pkg.isEnabled() && !pkg.isCreated()) {
+      await this.#ensurePackageCreated(pkg);
+    }
+
+    let packageName;
+    let libraryName;
+    let prepareOption;
+    let statementType;
+    if (pkg && pkg.isEnabled()) {
+      libraryName = pkg.getLibraryName();
+      if (pkg.isPackaged(sql)) {
+        packageName = pkg.getName();
+        prepareOption = 1;
+      } else {
+        packageName = null;
+        prepareOption = 0;
+      }
+      statementType = inferStatementType(sql);
+    }
+
+    const reqBuf = DBRequestDS.buildExecuteImmediate({
+      rpbId,
+      sqlText: sql,
+      identifierCcsid: this.#serverCCSID,
+      packageName,
+      libraryName,
+      prepareOption,
+      statementType,
+    });
     const replyBuf = await this.#connection.sendAndReceive(reqBuf);
     const reply = parseOperationReply(replyBuf, { serverCCSID: this.#serverCCSID });
     throwIfError(reply.sqlca, 'Execute immediate');
@@ -1259,5 +1366,95 @@ export class StatementManager {
 
   get openStatementCount() {
     return this.#statements.size;
+  }
+
+  /**
+   * Execute CREATE PACKAGE once per connection. Called lazily from
+   * `prepareStatement` / `executeImmediate` on the first eligible
+   * call with a package-enabled manager. Mirrors
+   * `JDPackageManager.create`:
+   *
+   *   - SQLCODE/returnCode  0     → fresh create, mark created
+   *   - SQLCODE -601              → package already exists, still
+   *                                 counts as created (same as JTOpen)
+   *   - anything else             → report failure via packageError
+   *                                 policy (none/warning/exception)
+   *                                 and disable the manager; for
+   *                                 warning/none paths subsequent
+   *                                 prepares fall back to the
+   *                                 packageless path.
+   *
+   * Uses the connection-scoped RPB id from the PackageManager itself
+   * (mirroring JTOpen's connection `id_`) — NOT the per-statement
+   * rpbId. Reusing an in-flight prepare's handle would conflate
+   * package identity with statement identity on live servers.
+   *
+   * After a successful create we optionally issue RETURN_PACKAGE when
+   * the user asked for `packageCache`. The raw blob is stored for
+   * later decoding; the cache-hit skip-prepare path is NOT enabled
+   * yet — it requires DBReplyPackageInfo parsing and live-host
+   * qualification.
+   */
+  async #ensurePackageCreated(pkg) {
+    const rpbId = pkg.rpbId;
+    try {
+      const reqBuf = DBRequestDS.buildCreatePackage({
+        rpbId,
+        packageName: pkg.getName(),
+        packageLibrary: pkg.getLibraryName(),
+        identifierCcsid: this.#serverCCSID,
+      });
+      const replyBuf = await this.#connection.sendAndReceive(reqBuf);
+      const reply = parseOperationReply(replyBuf, { serverCCSID: this.#serverCCSID });
+      const sqlca = reply.sqlca;
+      // JTOpen treats SQLCODE -601 as "already exists" — same
+      // result from our POV (the server-side package is ready for
+      // subsequent prepares).
+      if (sqlca && sqlca.isError && sqlca.sqlCode !== -601) {
+        // `reportFailure` throws for exception policy, so the
+        // return-line below runs only on warning/none.
+        pkg.reportFailure(
+          `CREATE PACKAGE failed: SQLCODE ${sqlca.sqlCode} SQLSTATE ${sqlca.sqlState}`,
+          { sqlState: sqlca.sqlState || '42704', vendorCode: sqlca.sqlCode },
+        );
+        return;
+      }
+      pkg.markCreated();
+    } catch (err) {
+      if (err && err.packagePolicy === 'exception') throw err;
+      pkg.reportFailure(
+        `CREATE PACKAGE threw: ${err?.message || err}`,
+        { sqlState: '58004', vendorCode: 0 },
+      );
+      return;
+    }
+
+    if (!pkg.isCacheRequested()) return;
+
+    try {
+      const reqBuf = DBRequestDS.buildReturnPackage({
+        rpbId,
+        packageName: pkg.getName(),
+        packageLibrary: pkg.getLibraryName(),
+        identifierCcsid: this.#serverCCSID,
+        returnSize: 0,
+      });
+      const replyBuf = await this.#connection.sendAndReceive(reqBuf);
+      const reply = parseOperationReply(replyBuf, { serverCCSID: this.#serverCCSID });
+      if (reply.sqlca && reply.sqlca.isError) {
+        // Matches JDPackageManager.cache: disable caching on error,
+        // leave extendedDynamic itself on.
+        pkg.setCachedRaw(null, 0);
+        return;
+      }
+      // ORS PACKAGE_INFORMATION bit makes the server return a
+      // PACKAGE_INFO codepoint in the reply. We keep the raw bytes
+      // for later decoding; the cache-hit skip-prepare path requires
+      // DBReplyPackageInfo decoding and is deferred to the next pass.
+      pkg.setCachedRaw(replyBuf, 0);
+    } catch {
+      // Silent — cache is opportunistic. Leave created=true so
+      // future prepares still carry the package name.
+    }
   }
 }

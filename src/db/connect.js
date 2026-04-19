@@ -81,19 +81,55 @@ export async function connect(systemOrUrl, opts = {}) {
 export function createPool(options = {}) {
   return new ConnectionPool({
     ...options,
-    connect: () => connect({
-      host: options.host,
-      user: options.user,
-      password: options.password,
-      port: options.port,
-      secure: options.secure,
-      libraries: options.libraries,
-      naming: options.naming,
-      dateFormat: options.dateFormat,
-      timeFormat: options.timeFormat,
-      defaultSchema: options.defaultSchema,
-    }),
+    connect: () => connect(buildConnectOptions(options)),
   });
+}
+
+/**
+ * Collect connect-time options from a caller-supplied `options` bag.
+ *
+ * Centralized so `createPool` and any future pooled-connection
+ * factories forward the SAME set of knobs — previously `createPool`
+ * dropped `extendedDynamic` / `sqlPackage` / `packageLibrary` /
+ * `packageCache` / `packageError`, so pooled connections silently
+ * lost all package-cache behavior even when the caller asked for it.
+ *
+ * Keys listed here should match the `KNOWN_PROPERTIES` set in
+ * `properties.js`. When adding a new knob, update both.
+ *
+ * Exported (under a leading underscore to signal "internal use") so
+ * tests can assert forwarding without peeking at `ConnectionPool`
+ * private state.
+ */
+export function _buildConnectOptionsForPool(options) {
+  return buildConnectOptions(options);
+}
+
+function buildConnectOptions(options) {
+  const keys = [
+    // Connection identity.
+    'host', 'user', 'password', 'port', 'secure', 'protocol',
+    // Schema / library / naming.
+    'libraries', 'naming', 'defaultSchema',
+    // Date/time/decimal formatting.
+    'dateFormat', 'dateSeparator', 'timeFormat', 'timeSeparator',
+    'decimalSeparator',
+    // Transaction behaviour.
+    'isolation', 'autoCommit', 'trueAutoCommit', 'holdStatements',
+    // Performance / blocking knobs.
+    'blockSize', 'blockCriteria', 'prefetch', 'lazyClose',
+    'translateBinary', 'translateHex',
+    // Extended dynamic / SQL packages.
+    'extendedDynamic', 'sqlPackage', 'packageLibrary', 'packageCache',
+    'packageError',
+    // Sort sequence.
+    'sortType', 'sortLanguage', 'sortTable', 'sortWeight', 'sortSequence',
+  ];
+  const out = {};
+  for (const k of keys) {
+    if (options[k] !== undefined) out[k] = options[k];
+  }
+  return out;
 }
 
 /**

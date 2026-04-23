@@ -42,6 +42,7 @@ const REPLY_CP = {
   RESULT_DATA_DS0:          0x3806,  // Result data at DS level 0
   SQLCA:                    0x3807,
   PARAMETER_MARKER_FORMAT:  0x3808,
+  PACKAGE_RETURN_INFO:      0x380B,  // Package info from RETURN_PACKAGE (JTOpen DBBaseReplyDS case 0x380B)
   RESULT_DATA:              0x380E,
   EXT_COLUMN_DESCRIPTORS:   0x3811,
   SUPER_EXT_DATA_FORMAT:    0x3812,

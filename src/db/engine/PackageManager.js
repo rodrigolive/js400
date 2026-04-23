@@ -190,6 +190,8 @@ export class PackageManager {
   #created;
   #cachedRaw;
   #cachedStatementCount;
+  #cachedPackageInfo;
+  #packageCriteria;
   #lastError;
   #pendingWarning;
   #rpbId;
@@ -222,6 +224,8 @@ export class PackageManager {
     this.#created = false;
     this.#cachedRaw = null;
     this.#cachedStatementCount = 0;
+    this.#cachedPackageInfo = null;
+    this.#packageCriteria = normalizePackageCriteria(opts.packageCriteria);
     this.#lastError = null;
     this.#pendingWarning = null;
     this.#rpbId = Number.isFinite(opts.rpbId) ? (opts.rpbId | 0) : 0;
@@ -339,13 +343,14 @@ export class PackageManager {
 
   isEnabled() { return this.#enabled; }
   isCreated() { return this.#created; }
-  isCached() { return this.#cachedRaw !== null; }
+  isCached() { return this.#cachedPackageInfo !== null; }
 
   getName() { return this.#name; }
   getLibraryName() { return this.#libraryName; }
   getErrorPolicy() { return this.#errorPolicy; }
   getCachedRaw() { return this.#cachedRaw; }
   getCachedStatementCount() { return this.#cachedStatementCount; }
+  getCachedPackageInfo() { return this.#cachedPackageInfo; }
   getLastError() { return this.#lastError; }
   isCacheRequested() { return this.#cache; }
 
@@ -365,15 +370,51 @@ export class PackageManager {
    * `DBReplyPackageInfo` to decode statement names + data formats,
    * the cache-hit skip-prepare path can pull from here.
    */
-  setCachedRaw(buf, statementCount = 0) {
+  setCachedRaw(buf, statementCount = 0, packageInfo = null) {
     this.#cachedRaw = buf ?? null;
     this.#cachedStatementCount = statementCount | 0;
+    this.#cachedPackageInfo = packageInfo ?? null;
     this.#metrics.packageFetches++;
   }
 
-  /** Record a cached-statement lookup that reused a packaged name. */
+  lookup(sql) {
+    if (!this.isCached()) return null;
+    if (!this.isPackaged(sql)) return null;
+
+    const statementText = String(sql ?? '');
+    const statementTextLength = this.#getLookupTextLength(statementText);
+    for (const entry of this.#cachedPackageInfo.entries) {
+      if (statementTextLength !== entry.statementTextLength) continue;
+      if (statementText !== entry.statementText) continue;
+      return entry;
+    }
+    return null;
+  }
+
+  getCachedStatementName(index) {
+    return this.#cachedPackageInfo?.entries?.[index]?.statementName ?? '';
+  }
+
+  getCachedDataFormat(index) {
+    return this.#cachedPackageInfo?.entries?.[index]?.resultDataFormat ?? null;
+  }
+
+  getCachedParameterMarkerFormat(index) {
+    return this.#cachedPackageInfo?.entries?.[index]?.parameterMarkerFormat ?? null;
+  }
+
   recordHit() {
     this.#metrics.packageHits++;
+  }
+
+  #getLookupTextLength(statementText) {
+    const entries = this.#cachedPackageInfo?.entries;
+    if (!entries || entries.length === 0) return statementText.length;
+    const sample = entries.find(entry => typeof entry.statementText === 'string' && entry.statementText.length > 0);
+    if (!sample) return statementText.length;
+    return sample.statementTextLength === (sample.statementText.length * 2)
+      ? statementText.length * 2
+      : statementText.length;
   }
 
   /**
@@ -467,7 +508,8 @@ export class PackageManager {
     return (hasParameter && !isCurrentOf)
       || (isInsert && isSubSelect)
       || (isSelect && isForUpdate)
-      || isDeclare;
+      || isDeclare
+      || (this.#packageCriteria === 'select' && isSelect);
   }
 
   /**
@@ -478,6 +520,7 @@ export class PackageManager {
     this.#created = false;
     this.#cachedRaw = null;
     this.#cachedStatementCount = 0;
+    this.#cachedPackageInfo = null;
     this.#lastError = null;
     this.#pendingWarning = null;
   }
@@ -496,6 +539,12 @@ function normalizeErrorPolicy(value) {
     case 'warning':   return PackageErrorPolicy.WARNING;
     default:          return PackageErrorPolicy.WARNING;
   }
+}
+
+function normalizePackageCriteria(value) {
+  return typeof value === 'string' && value.toLowerCase() === 'select'
+    ? 'select'
+    : 'default';
 }
 
 /**

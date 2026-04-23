@@ -6,34 +6,71 @@
   "engines": {
     "node": ">=20"
   },
-  "main": "./src/index.js",
+  "main": "./cjs/index.js",
   "types": "./types/index.d.ts",
   "exports": {
     ".": {
-      "types": "./types/index.d.ts",
-      "default": "./src/index.js"
+      "import": {
+        "types": "./types/index.d.ts",
+        "default": "./src/index.js"
+      },
+      "require": {
+        "types": "./types/index.d.ts",
+        "default": "./cjs/index.js"
+      }
     },
     "./datatypes": {
-      "types": "./types/datatypes.d.ts",
-      "default": "./src/datatypes/index.js"
+      "import": {
+        "types": "./types/datatypes.d.ts",
+        "default": "./src/datatypes/index.js"
+      },
+      "require": {
+        "types": "./types/datatypes.d.ts",
+        "default": "./cjs/datatypes.js"
+      }
     },
     "./pcml": {
-      "types": "./types/pcml.d.ts",
-      "default": "./src/pcml/index.js"
+      "import": {
+        "types": "./types/pcml.d.ts",
+        "default": "./src/pcml/index.js"
+      },
+      "require": {
+        "types": "./types/pcml.d.ts",
+        "default": "./cjs/pcml.js"
+      }
     },
     "./db": {
-      "types": "./types/db.d.ts",
-      "default": "./src/db/index.js"
+      "import": {
+        "types": "./types/db.d.ts",
+        "default": "./src/db/index.js"
+      },
+      "require": {
+        "types": "./types/db.d.ts",
+        "default": "./cjs/db.js"
+      }
     },
     "./print": {
-      "types": "./types/print.d.ts",
-      "default": "./src/print/index.js"
+      "import": {
+        "types": "./types/print.d.ts",
+        "default": "./src/print/index.js"
+      },
+      "require": {
+        "types": "./types/print.d.ts",
+        "default": "./cjs/print.js"
+      }
     },
     "./record": {
-      "default": "./src/record/index.js"
+      "import": {
+        "default": "./src/record/index.js"
+      },
+      "require": {
+        "default": "./cjs/record.js"
+      }
     }
   },
   "scripts": {
+    "build:cjs": "node scripts/build-cjs.cjs",
+    "prepublishOnly": "node scripts/build-cjs.cjs",
     "test": "node --import ./tests/bun-test-shim.js --test tests/",
     "test:bun": "bun test tests/",
     "test:integration": "bun test tests/integration/",
@@ -52,6 +89,7 @@
   "license": "MIT",
   "files": [
     "src",
+    "cjs",
     "types"
   ],
   "repository": {

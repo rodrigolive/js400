@@ -50,8 +50,12 @@
     "ebcdic"
   ],
   "license": "MIT",
+  "files": [
+    "src",
+    "types"
+  ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/user/js400.git"
+    "url": "git+https://github.com/rodrigolive/js400.git"
   }
 }

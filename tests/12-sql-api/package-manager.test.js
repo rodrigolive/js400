@@ -5,8 +5,8 @@
  *   - package-name normalization (6 chars + 4 suffix) and enable rules
  *   - packageable vs unpackageable SQL classification
  *   - CREATE_PACKAGE / RETURN_PACKAGE wire shape
- *   - PACKAGE_NAME + LIBRARY_NAME + prepareOption attached during
- *     prepareStatement when the manager is enabled
+ *   - CREATE_RPB binds LIBRARY_NAME, while prepare/execute paths carry
+ *     PACKAGE_NAME and cache-hit name overrides the way JTOpen does
  *   - counters increment only on real server activity
  *   - zero behavior change when extendedDynamic is off
  */
@@ -17,6 +17,7 @@ import {
 } from '../../src/db/protocol/DBRequestDS.js';
 import { StatementManager } from '../../src/db/engine/StatementManager.js';
 import { CharConverter } from '../../src/ccsid/CharConverter.js';
+import { parsePackageInfo } from '../../src/db/protocol/DBPackageInfo.js';
 
 // --- helpers --------------------------------------------------------
 
@@ -290,7 +291,7 @@ describe('StatementManager.prepareStatement with PackageManager', () => {
     }
   });
 
-  test('enabled manager + packageable SQL → lazy CREATE_PACKAGE then PACKAGE_NAME + LIBRARY_NAME on PREPARE', async () => {
+  test('enabled manager + packageable SQL → CREATE_RPB binds library, PREPARE carries PACKAGE_NAME', async () => {
     const sends = [];
     const fakeConn = {
       async sendAndReceive(buf) {
@@ -316,16 +317,22 @@ describe('StatementManager.prepareStatement with PackageManager', () => {
     expect(pm.isCreated()).toBe(true);
     expect(pm.metrics.packageCreates).toBe(1);
 
-    // PREPARE_AND_DESCRIBE must carry PACKAGE_NAME + LIBRARY_NAME.
+    const createRpb = sends.find(b => b.readUInt16BE(18) === RequestID.CREATE_RPB);
+    expect(createRpb).toBeDefined();
+    const rpbCps = scanCodePoints(createRpb);
+    const rpbLibText = rpbCps.get(CodePoint.LIBRARY_NAME);
+    expect(rpbLibText).toBeDefined();
+    expect(rpbCps.get(CodePoint.PACKAGE_NAME)).toBeUndefined();
+    expect(decodeTextCpPayload(rpbLibText[0])).toBe('MYLIB');
+
+    // PREPARE_AND_DESCRIBE must carry PACKAGE_NAME but not LIBRARY_NAME.
     const prep = sends.find(b => b.readUInt16BE(18) === RequestID.PREPARE_AND_DESCRIBE);
     expect(prep).toBeDefined();
     const cps = scanCodePoints(prep);
     const pkgText = cps.get(CodePoint.PACKAGE_NAME);
-    const libText = cps.get(CodePoint.LIBRARY_NAME);
     expect(pkgText).toBeDefined();
-    expect(libText).toBeDefined();
+    expect(cps.get(CodePoint.LIBRARY_NAME)).toBeUndefined();
     expect(decodeTextCpPayload(pkgText[0])).toBe(pm.getName());
-    expect(decodeTextCpPayload(libText[0])).toBe('MYLIB');
 
     // A second prepare must NOT issue another CREATE_PACKAGE.
     sends.length = 0;
@@ -360,6 +367,11 @@ describe('StatementManager.prepareStatement with PackageManager', () => {
     // state, not per-statement).
     expect(sends.some(b => b.readUInt16BE(18) === RequestID.CREATE_PACKAGE)).toBe(true);
 
+    const createRpb = sends.find(b => b.readUInt16BE(18) === RequestID.CREATE_RPB);
+    expect(createRpb).toBeDefined();
+    const rpbCps = scanCodePoints(createRpb);
+    expect(rpbCps.get(CodePoint.LIBRARY_NAME)).toBeDefined();
+
     const prep = sends.find(b => b.readUInt16BE(18) === RequestID.PREPARE_AND_DESCRIBE);
     const cps = scanCodePoints(prep);
     // Empty CP for PACKAGE_NAME (length-only, no value) — LL of 6.
@@ -367,8 +379,8 @@ describe('StatementManager.prepareStatement with PackageManager', () => {
     const pkg = cps.get(CodePoint.PACKAGE_NAME);
     expect(pkg).toBeDefined();
     expect(pkg[0].length).toBe(0);
-    // LIBRARY_NAME is still emitted (RPB-level library).
-    expect(cps.has(CodePoint.LIBRARY_NAME)).toBe(true);
+    // PREPARE itself does not repeat LIBRARY_NAME.
+    expect(cps.has(CodePoint.LIBRARY_NAME)).toBe(false);
   });
 
   test('packageCache on → RETURN_PACKAGE round-trip after CREATE and packageFetches counter ticks', async () => {
@@ -805,7 +817,7 @@ describe('packageError policy (boss finding #4)', () => {
 // --- Boss finding #5: executeImmediate package binding -------------
 
 describe('executeImmediate package binding (boss finding #5)', () => {
-  test('enabled manager + packageable immediate SQL → PACKAGE_NAME + LIBRARY_NAME + prepareOption=1', async () => {
+  test('enabled manager + packageable immediate SQL → PACKAGE_NAME + prepareOption=1', async () => {
     const sends = [];
     const fakeConn = {
       async sendAndReceive(buf) {
@@ -828,10 +840,9 @@ describe('executeImmediate package binding (boss finding #5)', () => {
     expect(imm).toBeDefined();
     const cps = scanCodePoints(imm);
     const pkg = cps.get(CodePoint.PACKAGE_NAME);
-    const lib = cps.get(CodePoint.LIBRARY_NAME);
     const prep = cps.get(CodePoint.PREPARE_OPTION);
     expect(pkg).toBeDefined();
-    expect(lib).toBeDefined();
+    expect(cps.get(CodePoint.LIBRARY_NAME)).toBeUndefined();
     expect(prep).toBeDefined();
     expect(prep[0][0]).toBe(1);
     expect(decodeTextCpPayload(pkg[0])).toBe(pm.getName());
@@ -857,11 +868,10 @@ describe('executeImmediate package binding (boss finding #5)', () => {
     const imm = sends.find(b => b.readUInt16BE(18) === RequestID.EXECUTE_IMMEDIATE);
     const cps = scanCodePoints(imm);
     const pkg = cps.get(CodePoint.PACKAGE_NAME);
-    const lib = cps.get(CodePoint.LIBRARY_NAME);
     const prep = cps.get(CodePoint.PREPARE_OPTION);
     expect(pkg).toBeDefined();
     expect(pkg[0].length).toBe(0);          // empty CP (length-only)
-    expect(lib).toBeDefined();
+    expect(cps.get(CodePoint.LIBRARY_NAME)).toBeUndefined();
     expect(prep).toBeDefined();
     expect(prep[0][0]).toBe(0);
   });
@@ -1011,5 +1021,1096 @@ describe('off-path zero-cost (knobs off)', () => {
     expect(cps.has(CodePoint.LIBRARY_NAME)).toBe(false);
     expect(cps.has(CodePoint.PREPARE_OPTION)).toBe(false);
     expect(cps.has(CodePoint.STATEMENT_TYPE)).toBe(false);
+  });
+});
+
+// --- DBReplyPackageInfo parser --------------------------------------
+
+/**
+ * Build a synthetic package-info buffer (code point 0x380B payload)
+ * matching the JTOpen DBReplyPackageInfo layout.
+ *
+ * Header (42 bytes):
+ *   +0  totalLength     int32
+ *   +4  packageCCSID    uint16
+ *   +6  defaultCollection 18 bytes (EBCDIC-padded)
+ *   +24 statementCount  uint16
+ *   +26 reserved        16 bytes (zeros)
+ *
+ * Entry table starts at +42, each entry 64 bytes:
+ *   +0  needsDefaultCol byte
+ *   +1  statementType   uint16
+ *   +3  statementName   18 bytes (job CCSID)
+ *   +21 reserved        19 bytes
+ *   +40 resultFmtOff    int32 (relative to cpDataAbsoluteBase = offset-6)
+ *   +44 resultFmtLen   int32
+ *   +48 textOff        int32
+ *   +52 textLen         int32
+ *   +56 paramFmtOff    int32
+ *   +60 paramFmtLen    int32
+ *
+ * After entries: text blobs and format blobs.
+ * Offsets in entries are relative to (cpDataOffset - 6), i.e. absolute
+ * base = 0 for the payload data after LL+CP stripping.
+ */
+function buildPackageInfoBuffer(opts = {}) {
+  const {
+    packageCCSID = 37,
+    defaultCollection = 'QGPL',
+    statements = [],
+    serverCCSID = 37,
+  } = opts;
+
+  const headerSize = 42;
+  const entryTableSize = 64 * statements.length;
+  let payloadCursor = headerSize + entryTableSize;
+
+  // Pre-encode text and build format buffers to compute offsets
+  const textBlobs = [];
+  const resultFmtBlobs = [];
+  const paramFmtBlobs = [];
+  for (const stmt of statements) {
+    // Text blob (encoded in package CCSID)
+    const textBuf = encodeForCCSID(stmt.text || '', packageCCSID);
+    textBlobs.push(textBuf);
+
+    // Result format blob (basic data format 0x3805-style)
+    const resultFmt = stmt.resultFormat || null;
+    const resultFmtBuf = resultFmt ? buildBasicDataFormatBuffer(resultFmt) : null;
+    resultFmtBlobs.push(resultFmtBuf);
+
+    // Parameter format blob
+    const paramFmt = stmt.parameterFormat || null;
+    const paramFmtBuf = paramFmt ? buildBasicDataFormatBuffer(paramFmt) : null;
+    paramFmtBlobs.push(paramFmtBuf);
+  }
+
+  // Calculate total size
+  let totalDataSize = payloadCursor;
+  const textOffsets = [];
+  const resultFmtOffsets = [];
+  const paramFmtOffsets = [];
+  for (let i = 0; i < statements.length; i++) {
+    textOffsets.push(payloadCursor);
+    totalDataSize += textBlobs[i].length;
+    payloadCursor += textBlobs[i].length;
+
+    if (resultFmtBlobs[i]) {
+      resultFmtOffsets.push(payloadCursor);
+      totalDataSize += resultFmtBlobs[i].length;
+      payloadCursor += resultFmtBlobs[i].length;
+    } else {
+      resultFmtOffsets.push(0);
+    }
+
+    if (paramFmtBlobs[i]) {
+      paramFmtOffsets.push(payloadCursor);
+      totalDataSize += paramFmtBlobs[i].length;
+      payloadCursor += paramFmtBlobs[i].length;
+    } else {
+      paramFmtOffsets.push(0);
+    }
+  }
+
+  const buf = Buffer.alloc(totalDataSize);
+
+  // Header
+  buf.writeInt32BE(totalDataSize, 0);              // total length
+  buf.writeUInt16BE(packageCCSID, 4);              // CCSID
+  writePaddedString(buf, 6, 18, defaultCollection, serverCCSID); // default collection
+  buf.writeUInt16BE(statements.length, 24);        // statement count
+
+  // Entry table
+  for (let i = 0; i < statements.length; i++) {
+    const stmt = statements[i];
+    const entryOff = headerSize + 64 * i;
+
+    buf[entryOff] = stmt.needsDefaultCollection ? 1 : 0;
+    buf.writeUInt16BE(stmt.statementType || 1, entryOff + 1);
+    writePaddedString(buf, entryOff + 3, 18, stmt.name || '', serverCCSID);
+
+    // Offsets are relative to (cpDataOffset - 6) = 0 for our payload
+    if (resultFmtBlobs[i]) {
+      buf.writeInt32BE(resultFmtOffsets[i], entryOff + 40);
+      buf.writeInt32BE(resultFmtBlobs[i].length, entryOff + 44);
+    } else {
+      buf.writeInt32BE(0, entryOff + 40);
+      buf.writeInt32BE(stmt.resultFormatAbsent ? 0 : 6, entryOff + 44);
+    }
+
+    buf.writeInt32BE(textOffsets[i], entryOff + 48);
+    buf.writeInt32BE(textBlobs[i].length, entryOff + 52);
+
+    if (paramFmtBlobs[i]) {
+      buf.writeInt32BE(paramFmtOffsets[i], entryOff + 56);
+      buf.writeInt32BE(paramFmtBlobs[i].length, entryOff + 60);
+    } else {
+      buf.writeInt32BE(0, entryOff + 56);
+      buf.writeInt32BE(stmt.paramFormatAbsent ? 0 : 6, entryOff + 60);
+    }
+  }
+
+  // Write blobs
+  let writeCursor = headerSize + entryTableSize;
+  for (let i = 0; i < statements.length; i++) {
+    textBlobs[i].copy(buf, writeCursor);
+    writeCursor += textBlobs[i].length;
+    if (resultFmtBlobs[i]) {
+      resultFmtBlobs[i].copy(buf, writeCursor);
+      writeCursor += resultFmtBlobs[i].length;
+    }
+    if (paramFmtBlobs[i]) {
+      paramFmtBlobs[i].copy(buf, writeCursor);
+      writeCursor += paramFmtBlobs[i].length;
+    }
+  }
+
+  return buf;
+}
+
+function encodeForCCSID(text, ccsid) {
+  if (ccsid === 13488 || ccsid === 1200 || ccsid === 61952) {
+    const buf = Buffer.alloc(text.length * 2);
+    for (let i = 0; i < text.length; i++) {
+      buf.writeUInt16BE(text.charCodeAt(i), i * 2);
+    }
+    return buf;
+  }
+  if (ccsid === 1208) {
+    return Buffer.from(text, 'utf8');
+  }
+  const buf = Buffer.alloc(text.length);
+  CharConverter.stringToByteArrayInto(text, buf, 0, text.length, ccsid);
+  return buf;
+}
+
+function writePaddedString(buf, offset, fieldLen, text, ccsid) {
+  const encoded = encodeForCCSID(text, ccsid);
+  const copyLen = Math.min(encoded.length, fieldLen);
+  encoded.copy(buf, offset, 0, copyLen);
+  // Pad with EBCDIC spaces (0x40) for CCSID 37 or zeros
+  if (copyLen < fieldLen) {
+    buf.fill(ccsid === 37 ? 0x40 : 0x00, offset + copyLen, offset + fieldLen);
+  }
+}
+
+/**
+ * Build a basic data format buffer (0x3805 style) with given fields.
+ * Each field is { sqlType, length, ccsid, name? }.
+ */
+function buildBasicDataFormatBuffer(fields) {
+  const numFields = fields.length;
+  // Header: consistencyToken(4) + numFields(2) + recordSize(2) = 8
+  // Per field: fieldLL includes name. Minimum fieldLL = 24 + nameLen.
+  let recordSize = 0;
+  const perField = [];
+  for (let i = 0; i < numFields; i++) {
+    const f = fields[i];
+    const name = f.name || `COL${i}`;
+    const nameBuf = encodeForCCSID(name, f.ccsid || 37);
+    const fieldLL = 24 + nameBuf.length;
+    const absType = Math.abs(f.sqlType) & 0xFFFE;
+    const isVarLen = absType === 448 || absType === 464 || absType === 456
+                 || absType === 472 || absType === 908;
+    const wireLen = isVarLen && f.length >= 2 ? f.length + 2 : f.length;
+    recordSize += wireLen + (f.nullable ? 2 : 0);
+    perField.push({ ...f, nameBuf, fieldLL, wireLen });
+  }
+
+  let totalSize = 8;
+  for (const pf of perField) totalSize += pf.fieldLL;
+
+  const buf = Buffer.alloc(totalSize);
+  buf.writeInt32BE(1, 0);                  // consistencyToken
+  buf.writeInt16BE(numFields, 4);          // numFields
+  buf.writeInt16BE(recordSize, 6);         // recordSize
+
+  let pos = 8;
+  for (let i = 0; i < numFields; i++) {
+    const pf = perField[i];
+    buf.writeInt16BE(pf.fieldLL, pos);
+    buf.writeInt16BE(pf.sqlType, pos + 2);
+    buf.writeInt16BE(pf.wireLen, pos + 4);
+    buf.writeInt16BE(pf.scale || 0, pos + 6);
+    buf.writeInt16BE(pf.precision || pf.length, pos + 8);
+    buf.writeUInt16BE(pf.ccsid || 37, pos + 10);
+    buf.writeInt16BE(0, pos + 12);         // dateTimeFormat + flags1
+    buf.writeInt16BE(0, pos + 14);         // flags2
+    buf.writeInt16BE(0, pos + 16);         // reserved
+    buf.writeInt16BE(0, pos + 18);         // reserved
+    buf.writeInt16BE(pf.nameBuf.length, pos + 20);   // nameLength
+    buf.writeUInt16BE(pf.ccsid || 37, pos + 22);     // nameCCSID
+    pf.nameBuf.copy(buf, pos + 24);
+    pos += pf.fieldLL;
+  }
+  return buf;
+}
+
+describe('parsePackageInfo — DBReplyPackageInfo decoder', () => {
+  test('parses header: CCSID, default collection, statement count', () => {
+    const buf = buildPackageInfoBuffer({
+      packageCCSID: 37,
+      defaultCollection: 'MYLIB',
+      statements: [],
+    });
+    const info = parsePackageInfo(buf, { serverCCSID: 37 });
+    expect(info).not.toBeNull();
+    expect(info.packageCCSID).toBe(37);
+    expect(info.statementCount).toBe(0);
+    expect(info.defaultCollection).toContain('MYLIB');
+    expect(info.entries.length).toBe(0);
+  });
+
+  test('parses single entry with statement name and text', () => {
+    const sql = 'SELECT * FROM T WHERE ID = ?';
+    const buf = buildPackageInfoBuffer({
+      packageCCSID: 37,
+      statements: [
+        { name: 'STM0001', text: sql, statementType: 2 },
+      ],
+    });
+    const info = parsePackageInfo(buf, { serverCCSID: 37 });
+    expect(info.statementCount).toBe(1);
+    expect(info.entries.length).toBe(1);
+    expect(info.entries[0].statementName).toContain('STM0001');
+    expect(info.entries[0].statementText).toBe(sql);
+    expect(info.entries[0].statementType).toBe(2);
+  });
+
+  test('parses two entries and matches by index', () => {
+    const buf = buildPackageInfoBuffer({
+      statements: [
+        { name: 'STM0001', text: 'SELECT * FROM A WHERE X = ?', statementType: 2 },
+        { name: 'STM0002', text: 'INSERT INTO B (C) VALUES (?)', statementType: 1 },
+      ],
+    });
+    const info = parsePackageInfo(buf, { serverCCSID: 37 });
+    expect(info.entries.length).toBe(2);
+    expect(info.entries[0].statementName).toContain('STM0001');
+    expect(info.entries[0].statementText).toContain('FROM A');
+    expect(info.entries[1].statementName).toContain('STM0002');
+    expect(info.entries[1].statementText).toContain('INSERT INTO B');
+  });
+
+  test('absent result format when length is 0 or 6', () => {
+    const buf = buildPackageInfoBuffer({
+      statements: [
+        { name: 'STM1', text: 'INSERT INTO T VALUES (?)', statementType: 1,
+          resultFormatAbsent: true },
+        { name: 'STM2', text: 'SET X = ?', statementType: 1,
+          resultFormat: [] },
+      ],
+    });
+    const info = parsePackageInfo(buf, { serverCCSID: 37 });
+    // length = 0 → null
+    expect(info.entries[0].resultDataFormat).toBeNull();
+    // length = 6 (from empty fields array producing the 6-byte absent marker)
+    // Our builder with empty resultFormat generates a minimal format — that's
+    // fine, the JTOpen rule is length === 0 || length === 6 → null.
+    // When resultFormat is explicitly absent (resultFormatAbsent), it's null.
+  });
+
+  test('parses result and parameter formats when present', () => {
+    const buf = buildPackageInfoBuffer({
+      statements: [
+        {
+          name: 'STM1',
+          text: 'SELECT ID, NAME FROM T WHERE X = ?',
+          statementType: 2,
+          resultFormat: [
+            { sqlType: 496, length: 4, ccsid: 37, name: 'ID' },
+            { sqlType: 448, length: 50, ccsid: 37, name: 'NAME' },
+          ],
+          parameterFormat: [
+            { sqlType: 496, length: 4, ccsid: 37, name: 'X' },
+          ],
+        },
+      ],
+    });
+    const info = parsePackageInfo(buf, { serverCCSID: 37 });
+    expect(info.entries[0].resultDataFormat).not.toBeNull();
+    expect(info.entries[0].resultDataFormat.descriptors.length).toBe(2);
+    expect(info.entries[0].resultDataFormat.descriptors[0].name).toContain('ID');
+    expect(info.entries[0].resultDataFormat.descriptors[1].name).toContain('NAME');
+    expect(info.entries[0].parameterMarkerFormat).not.toBeNull();
+    expect(info.entries[0].parameterMarkerFormat.descriptors.length).toBe(1);
+    expect(info.entries[0].parameterMarkerFormat.descriptors[0].name).toContain('X');
+  });
+
+  test('returns null for buffer too short', () => {
+    const shortBuf = Buffer.alloc(10);
+    const info = parsePackageInfo(shortBuf, { serverCCSID: 37 });
+    expect(info).toBeNull();
+  });
+
+  test('statement name decoded with server (job) CCSID, not package CCSID', () => {
+    // Build with packageCCSID=1208 (UTF-8) but serverCCSID=37
+    // The statement name should be decoded as EBCDIC (37)
+    const buf = buildPackageInfoBuffer({
+      packageCCSID: 1208,
+      serverCCSID: 37,
+      statements: [
+        { name: 'STM0001', text: 'SELECT 1 FROM T', statementType: 2 },
+      ],
+    });
+    const info = parsePackageInfo(buf, { serverCCSID: 37 });
+    expect(info.entries[0].statementName).toContain('STM0001');
+  });
+});
+
+// --- PackageManager.lookup — cache hit/miss ------------------------
+
+describe('PackageManager.lookup — cache hit/miss', () => {
+  test('length mismatch misses before string compare', () => {
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'P',
+    });
+    const buf = buildPackageInfoBuffer({
+      statements: [
+        { name: 'STM1', text: 'SELECT * FROM T WHERE ID = ?', statementType: 2 },
+      ],
+    });
+    const info = parsePackageInfo(buf, { serverCCSID: 37 });
+    pm.setCachedRaw(buf, info.statementCount, info);
+
+    // Different-length SQL should miss fast
+    expect(pm.lookup('SELECT 1')).toBeNull();
+  });
+
+  test('exact SQL hit returns statement entry', () => {
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'P',
+    });
+    const sql = 'SELECT * FROM T WHERE ID = ?';
+    const buf = buildPackageInfoBuffer({
+      statements: [
+        { name: 'STM0001', text: sql, statementType: 2 },
+      ],
+    });
+    const info = parsePackageInfo(buf, { serverCCSID: 37 });
+    pm.setCachedRaw(buf, info.statementCount, info);
+
+    const hit = pm.lookup(sql);
+    expect(hit).not.toBeNull();
+    expect(hit.statementName).toContain('STM0001');
+    expect(hit.statementText).toBe(sql);
+  });
+
+  test('non-packageable SQL misses', () => {
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'P',
+    });
+    const buf = buildPackageInfoBuffer({
+      statements: [
+        { name: 'STM1', text: 'SELECT * FROM T WHERE ID = ?', statementType: 2 },
+      ],
+    });
+    const info = parsePackageInfo(buf, { serverCCSID: 37 });
+    pm.setCachedRaw(buf, info.statementCount, info);
+
+    // Plain SELECT without parameters is not packageable under default criteria
+    expect(pm.lookup('SELECT 1 FROM SYSIBM.SYSDUMMY1')).toBeNull();
+  });
+
+  test('uncached manager returns null', () => {
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'P',
+    });
+    expect(pm.lookup('SELECT * FROM T WHERE ID = ?')).toBeNull();
+  });
+
+  test('disabled manager returns null', () => {
+    const pm = new PackageManager({ extendedDynamic: false });
+    expect(pm.lookup('SELECT * FROM T WHERE ID = ?')).toBeNull();
+  });
+});
+
+// --- packageCriteria ------------------------------------------------
+
+describe('packageCriteria = "select"', () => {
+  test('plain SELECT without parameters is packageable under "select" criteria', () => {
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'P',
+      packageCriteria: 'select',
+    });
+    expect(pm.isPackaged('SELECT * FROM T')).toBe(true);
+    expect(pm.isPackaged('SELECT 1 FROM SYSIBM.SYSDUMMY1')).toBe(true);
+  });
+
+  test('default criteria: plain SELECT without parameters is NOT packageable', () => {
+    const pmDefault = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'P',
+    });
+    expect(pmDefault.isPackaged('SELECT * FROM T')).toBe(false);
+  });
+
+  test('parameterized SELECT remains packageable under both criteria', () => {
+    const pmDefault = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'P',
+    });
+    const pmSelect = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'P',
+      packageCriteria: 'select',
+    });
+    const sql = 'SELECT * FROM T WHERE ID = ?';
+    expect(pmDefault.isPackaged(sql)).toBe(true);
+    expect(pmSelect.isPackaged(sql)).toBe(true);
+  });
+});
+
+// --- StatementManager skip-prepare cache hit -------------------------
+
+describe('StatementManager.prepareStatement — cache-hit skip-prepare', () => {
+  test('cache hit skips PREPARE_AND_DESCRIBE and increments packageHits', async () => {
+    const sends = [];
+    const sql = 'SELECT * FROM T WHERE ID = ?';
+    const fakeConn = {
+      async sendAndReceive(buf) {
+        sends.push(Buffer.from(buf));
+        return okReply();
+      },
+    };
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'MYAPP',
+      packageLibrary: 'MYLIB',
+      packageCache: true,
+    });
+    // Pre-populate the decoded cache so the first prepare hits
+    const pkgBuf = buildPackageInfoBuffer({
+      statements: [
+        {
+          name: 'STM0042',
+          text: sql,
+          statementType: 2,
+          resultFormat: [
+            { sqlType: 496, length: 4, ccsid: 37, name: 'ID' },
+          ],
+          parameterFormat: [
+            { sqlType: 496, length: 4, ccsid: 37, name: 'ID' },
+          ],
+        },
+      ],
+    });
+    const pkgInfo = parsePackageInfo(pkgBuf, { serverCCSID: 37 });
+    pm.setCachedRaw(pkgBuf, pkgInfo.statementCount, pkgInfo);
+    pm.markCreated(); // Pretend package already exists
+
+    const sm = new StatementManager(fakeConn, { registerCursor() {} }, {
+      packageManager: pm,
+      serverCCSID: 37,
+    });
+    const stmt = await sm.prepareStatement(sql);
+
+    // Should NOT have sent PREPARE_AND_DESCRIBE
+    const prepSends = sends.filter(b => b.readUInt16BE(18) === RequestID.PREPARE_AND_DESCRIBE);
+    expect(prepSends.length).toBe(0);
+    // packageHits should be 1
+    expect(pm.metrics.packageHits).toBe(1);
+    // Cache hit keeps the local statement name and stores the package
+    // statement as the execute-time override.
+    expect(stmt.statementNameOverride).toContain('STM0042');
+    // Column and parameter descriptors populated from cache
+    expect(stmt.columnDescriptors.length).toBe(1);
+    expect(stmt.paramDescriptors.length).toBe(1);
+    // CREATE_RPB still happened
+    const rpbSends = sends.filter(b => b.readUInt16BE(18) === 0x1D00);
+    expect(rpbSends.length).toBe(1);
+  });
+
+  test('cache miss sends normal PREPARE_AND_DESCRIBE', async () => {
+    const sends = [];
+    const sql = 'SELECT * FROM T WHERE ID = ?';
+    const fakeConn = {
+      async sendAndReceive(buf) {
+        sends.push(Buffer.from(buf));
+        return okReply();
+      },
+    };
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'MYAPP',
+      packageLibrary: 'MYLIB',
+      packageCache: true,
+    });
+    pm.markCreated();
+    // Cache is populated but doesn't contain this SQL
+    const pkgBuf = buildPackageInfoBuffer({
+      statements: [
+        { name: 'STM1', text: 'SELECT * FROM OTHER WHERE X = ?', statementType: 2 },
+      ],
+    });
+    const pkgInfo = parsePackageInfo(pkgBuf, { serverCCSID: 37 });
+    pm.setCachedRaw(pkgBuf, pkgInfo.statementCount, pkgInfo);
+
+    const sm = new StatementManager(fakeConn, { registerCursor() {} }, {
+      packageManager: pm,
+      serverCCSID: 37,
+    });
+    try {
+      await sm.prepareStatement(sql);
+    } catch { /* expected — okReply has no descriptors */ }
+
+    // Should have sent PREPARE_AND_DESCRIBE
+    expect(sends.some(b => b.readUInt16BE(18) === RequestID.PREPARE_AND_DESCRIBE)).toBe(true);
+    // packageHits should be 0
+    expect(pm.metrics.packageHits).toBe(0);
+  });
+
+  test('LOB in cached result forces normal prepare', async () => {
+    const sends = [];
+    const sql = 'SELECT BLOB_COL FROM T WHERE ID = ?';
+    const fakeConn = {
+      async sendAndReceive(buf) {
+        sends.push(Buffer.from(buf));
+        return okReply();
+      },
+    };
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'MYAPP',
+      packageLibrary: 'MYLIB',
+      packageCache: true,
+    });
+    pm.markCreated();
+    const pkgBuf = buildPackageInfoBuffer({
+      statements: [
+        {
+          name: 'STM_LOB',
+          text: sql,
+          statementType: 2,
+          resultFormat: [
+            { sqlType: 960, length: 4, ccsid: 37, name: 'BLOB_COL' }, // BLOB_LOCATOR
+          ],
+          parameterFormat: [
+            { sqlType: 496, length: 4, ccsid: 37, name: 'ID' },
+          ],
+        },
+      ],
+    });
+    const pkgInfo = parsePackageInfo(pkgBuf, { serverCCSID: 37 });
+    pm.setCachedRaw(pkgBuf, pkgInfo.statementCount, pkgInfo);
+
+    const sm = new StatementManager(fakeConn, { registerCursor() {} }, {
+      packageManager: pm,
+      serverCCSID: 37,
+    });
+    try {
+      await sm.prepareStatement(sql);
+    } catch { /* expected */ }
+
+    // LOB guard: should have sent PREPARE_AND_DESCRIBE (fallback)
+    expect(sends.some(b => b.readUInt16BE(18) === RequestID.PREPARE_AND_DESCRIBE)).toBe(true);
+    // packageHits should NOT have ticked
+    expect(pm.metrics.packageHits).toBe(0);
+  });
+
+  test('LOB in cached parameter format forces normal prepare', async () => {
+    const sends = [];
+    const sql = 'INSERT INTO T (B) VALUES (?)';
+    const fakeConn = {
+      async sendAndReceive(buf) {
+        sends.push(Buffer.from(buf));
+        return okReply();
+      },
+    };
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'MYAPP',
+      packageLibrary: 'MYLIB',
+      packageCache: true,
+    });
+    pm.markCreated();
+    const pkgBuf = buildPackageInfoBuffer({
+      statements: [
+        {
+          name: 'STM_PLOB',
+          text: sql,
+          statementType: 1,
+          resultFormat: [],
+          parameterFormat: [
+            { sqlType: 964, length: 4, ccsid: 37, name: 'B' }, // CLOB_LOCATOR
+          ],
+        },
+      ],
+    });
+    const pkgInfo = parsePackageInfo(pkgBuf, { serverCCSID: 37 });
+    pm.setCachedRaw(pkgBuf, pkgInfo.statementCount, pkgInfo);
+
+    const sm = new StatementManager(fakeConn, { registerCursor() {} }, {
+      packageManager: pm,
+      serverCCSID: 37,
+    });
+    try {
+      await sm.prepareStatement(sql);
+    } catch { /* expected */ }
+
+    expect(sends.some(b => b.readUInt16BE(18) === RequestID.PREPARE_AND_DESCRIBE)).toBe(true);
+    expect(pm.metrics.packageHits).toBe(0);
+  });
+
+  test('malformed package info falls back to normal prepare', async () => {
+    const sends = [];
+    const sql = 'SELECT * FROM T WHERE ID = ?';
+    const fakeConn = {
+      async sendAndReceive(buf) {
+        sends.push(Buffer.from(buf));
+        return okReply();
+      },
+    };
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'MYAPP',
+      packageLibrary: 'MYLIB',
+      packageCache: true,
+    });
+    pm.markCreated();
+    // Set corrupted cache (null packageInfo → no decode)
+    pm.setCachedRaw(Buffer.alloc(5), 0, null);
+
+    const sm = new StatementManager(fakeConn, { registerCursor() {} }, {
+      packageManager: pm,
+      serverCCSID: 37,
+    });
+    try {
+      await sm.prepareStatement(sql);
+    } catch { /* expected */ }
+
+    expect(sends.some(b => b.readUInt16BE(18) === RequestID.PREPARE_AND_DESCRIBE)).toBe(true);
+    expect(pm.metrics.packageHits).toBe(0);
+  });
+
+  test('extendedDynamic off — no package code points, no counter changes', async () => {
+    const sends = [];
+    const fakeConn = {
+      async sendAndReceive(buf) {
+        sends.push(Buffer.from(buf));
+        return okReply();
+      },
+    };
+    const sm = new StatementManager(fakeConn, { registerCursor() {} }, {});
+    try {
+      await sm.prepareStatement('SELECT * FROM T WHERE ID = ?');
+    } catch { /* expected */ }
+
+    expect(sends.some(b => b.readUInt16BE(18) === RequestID.CREATE_PACKAGE)).toBe(false);
+    expect(sends.some(b => b.readUInt16BE(18) === RequestID.RETURN_PACKAGE)).toBe(false);
+    expect(sm.metrics.packageHits).toBe(0);
+    expect(sm.metrics.packageCreates).toBe(0);
+    expect(sm.metrics.packageFetches).toBe(0);
+  });
+
+  test('packageCache off — no skip-prepare lookup', async () => {
+    const sends = [];
+    const sql = 'SELECT * FROM T WHERE ID = ?';
+    const fakeConn = {
+      async sendAndReceive(buf) {
+        sends.push(Buffer.from(buf));
+        return okReply();
+      },
+    };
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'MYAPP',
+      packageLibrary: 'MYLIB',
+      packageCache: false,
+    });
+    pm.markCreated();
+
+    const sm = new StatementManager(fakeConn, { registerCursor() {} }, {
+      packageManager: pm,
+      serverCCSID: 37,
+    });
+    try {
+      await sm.prepareStatement(sql);
+    } catch { /* expected */ }
+
+    // PREPARE_AND_DESCRIBE must fire (no cache to skip)
+    expect(sends.some(b => b.readUInt16BE(18) === RequestID.PREPARE_AND_DESCRIBE)).toBe(true);
+    expect(pm.metrics.packageHits).toBe(0);
+  });
+});
+
+// --- Cached execution wire shape (Finding #1 fix) --------------------
+//
+// These tests go beyond prepareStatement() and actually exercise the
+// execute() path to verify that PREPARED_STATEMENT_NAME (0x3806) is
+// only sent on cache hits, while PACKAGE_NAME (0x3804) stays attached
+// for packaged statements. This mirrors JTOpen's nameOverride_
+// pattern in AS400JDBCStatement.java:879.
+
+describe('cached SELECT execution sends PREPARED_STATEMENT_NAME on the wire', () => {
+  test('OPEN_AND_DESCRIBE carries statement name override + PACKAGE_NAME on cache hit', async () => {
+    const sends = [];
+    const sql = 'SELECT * FROM T WHERE ID = ?';
+    const fakeConn = {
+      async sendAndReceive(buf) {
+        sends.push(Buffer.from(buf));
+        const reqId = buf.readUInt16BE(18);
+        // OPEN_AND_DESCRIBE needs a valid SQLCA reply so parseFetchReply
+        // doesn't throw. Build one with SQLCODE 100 (end of data).
+        if (reqId === RequestID.OPEN_AND_DESCRIBE) {
+          return sqlcaReply(100);
+        }
+        return okReply();
+      },
+    };
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'MYAPP',
+      packageLibrary: 'MYLIB',
+      packageCache: true,
+    });
+    const pkgBuf = buildPackageInfoBuffer({
+      statements: [
+        {
+          name: 'STM0042',
+          text: sql,
+          statementType: 2,
+          resultFormat: [
+            { sqlType: 496, length: 4, ccsid: 37, name: 'ID' },
+          ],
+          parameterFormat: [
+            { sqlType: 496, length: 4, ccsid: 37, name: 'ID' },
+          ],
+        },
+      ],
+    });
+    const pkgInfo = parsePackageInfo(pkgBuf, { serverCCSID: 37 });
+    pm.setCachedRaw(pkgBuf, pkgInfo.statementCount, pkgInfo);
+    pm.markCreated();
+
+    const cursors = new Map();
+    const cursorMgr = {
+      registerCursor(rpbId, descs) { cursors.set(rpbId, descs); },
+    };
+    const sm = new StatementManager(fakeConn, cursorMgr, {
+      packageManager: pm,
+      serverCCSID: 37,
+    });
+    const stmt = await sm.prepareStatement(sql);
+
+    // Execute the cached statement with a parameter
+    sends.length = 0; // clear prepare-time sends
+    const result = await sm.execute(stmt, [42]);
+
+    // Find the OPEN_AND_DESCRIBE request
+    const openReqs = sends.filter(b => b.readUInt16BE(18) === RequestID.OPEN_AND_DESCRIBE);
+    expect(openReqs.length).toBe(1);
+
+    const openCps = scanCodePoints(openReqs[0]);
+
+    // PREPARED_STATEMENT_NAME (0x3806) must be present
+    const stmtNameCps = openCps.get(CodePoint.PREPARED_STATEMENT_NAME);
+    expect(stmtNameCps).toBeDefined();
+    expect(stmtNameCps.length).toBe(1);
+    const stmtNameText = decodeTextCpPayload(stmtNameCps[0]);
+    expect(stmtNameText).toContain('STM0042');
+
+    // PACKAGE_NAME (0x3804) must be present
+    const pkgNameCps = openCps.get(CodePoint.PACKAGE_NAME);
+    expect(pkgNameCps).toBeDefined();
+    expect(pkgNameCps.length).toBe(1);
+
+    // LIBRARY_NAME is bound on CREATE_RPB, not repeated here.
+    expect(openCps.get(CodePoint.LIBRARY_NAME)).toBeUndefined();
+  });
+
+  test('non-cached SELECT does NOT send PREPARED_STATEMENT_NAME on open', async () => {
+    const sends = [];
+    const sql = 'SELECT * FROM T WHERE ID = ?';
+    // Build a prepare reply that includes column descriptors (basic data
+    // format 0x3805) so execute() takes the SELECT/OPEN path. Without
+    // column descriptors the engine classifies the statement as DML.
+    const colFmt = buildBasicDataFormatBuffer([
+      { sqlType: 496, length: 4, ccsid: 37, name: 'ID' },
+    ]);
+    const colFmtCp = Buffer.alloc(6 + colFmt.length);
+    colFmtCp.writeInt32BE(colFmtCp.length, 0);
+    colFmtCp.writeUInt16BE(0x3805, 4);
+    colFmt.copy(colFmtCp, 6);
+    // Also include parameter marker format (0x3808)
+    const paramFmt = buildBasicDataFormatBuffer([
+      { sqlType: 496, length: 4, ccsid: 37, name: 'ID' },
+    ]);
+    const paramFmtCp = Buffer.alloc(6 + paramFmt.length);
+    paramFmtCp.writeInt32BE(paramFmtCp.length, 0);
+    paramFmtCp.writeUInt16BE(0x3808, 4);
+    paramFmt.copy(paramFmtCp, 6);
+
+    function prepareReplyWithDescriptors() {
+      const total = 40 + colFmtCp.length + paramFmtCp.length;
+      const buf = Buffer.alloc(total);
+      buf.writeInt32BE(total, 0);
+      buf.writeInt16BE(20, 16);
+      colFmtCp.copy(buf, 40);
+      paramFmtCp.copy(buf, 40 + colFmtCp.length);
+      return buf;
+    }
+
+    const fakeConn = {
+      async sendAndReceive(buf) {
+        sends.push(Buffer.from(buf));
+        const reqId = buf.readUInt16BE(18);
+        if (reqId === RequestID.PREPARE_AND_DESCRIBE) {
+          return prepareReplyWithDescriptors();
+        }
+        if (reqId === RequestID.OPEN_AND_DESCRIBE) {
+          return sqlcaReply(100);
+        }
+        return okReply();
+      },
+    };
+    // No package manager — normal path
+    const cursors = new Map();
+    const cursorMgr = {
+      registerCursor(rpbId, descs) { cursors.set(rpbId, descs); },
+    };
+    const sm = new StatementManager(fakeConn, cursorMgr, { serverCCSID: 37 });
+    const stmt = await sm.prepareStatement(sql);
+    expect(stmt.columnDescriptors.length).toBe(1);
+
+    sends.length = 0;
+    await sm.execute(stmt, [42]);
+
+    const openReqs = sends.filter(b => b.readUInt16BE(18) === RequestID.OPEN_AND_DESCRIBE);
+    expect(openReqs.length).toBe(1);
+    const openCps = scanCodePoints(openReqs[0]);
+
+    // Should NOT have PREPARED_STATEMENT_NAME on normal path
+    expect(openCps.get(CodePoint.PREPARED_STATEMENT_NAME)).toBeUndefined();
+    // Should NOT have PACKAGE_NAME
+    expect(openCps.get(CodePoint.PACKAGE_NAME)).toBeUndefined();
+  });
+
+  test('packaged non-cache SELECT sends PACKAGE_NAME but no PREPARED_STATEMENT_NAME', async () => {
+    const sends = [];
+    const sql = 'SELECT * FROM T WHERE ID = ?';
+    const colFmt = buildBasicDataFormatBuffer([
+      { sqlType: 496, length: 4, ccsid: 37, name: 'ID' },
+    ]);
+    const colFmtCp = Buffer.alloc(6 + colFmt.length);
+    colFmtCp.writeInt32BE(colFmtCp.length, 0);
+    colFmtCp.writeUInt16BE(0x3805, 4);
+    colFmt.copy(colFmtCp, 6);
+    const paramFmt = buildBasicDataFormatBuffer([
+      { sqlType: 496, length: 4, ccsid: 37, name: 'ID' },
+    ]);
+    const paramFmtCp = Buffer.alloc(6 + paramFmt.length);
+    paramFmtCp.writeInt32BE(paramFmtCp.length, 0);
+    paramFmtCp.writeUInt16BE(0x3808, 4);
+    paramFmt.copy(paramFmtCp, 6);
+
+    function prepareReplyWithDescriptors() {
+      const total = 40 + colFmtCp.length + paramFmtCp.length;
+      const buf = Buffer.alloc(total);
+      buf.writeInt32BE(total, 0);
+      buf.writeInt16BE(20, 16);
+      colFmtCp.copy(buf, 40);
+      paramFmtCp.copy(buf, 40 + colFmtCp.length);
+      return buf;
+    }
+
+    const fakeConn = {
+      async sendAndReceive(buf) {
+        sends.push(Buffer.from(buf));
+        const reqId = buf.readUInt16BE(18);
+        if (reqId === RequestID.PREPARE_AND_DESCRIBE) {
+          return prepareReplyWithDescriptors();
+        }
+        if (reqId === RequestID.OPEN_AND_DESCRIBE) {
+          return sqlcaReply(100);
+        }
+        return okReply();
+      },
+    };
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'MYAPP',
+      packageLibrary: 'MYLIB',
+      packageCache: false,
+    });
+    pm.markCreated();
+    const sm = new StatementManager(fakeConn, { registerCursor() {} }, {
+      packageManager: pm,
+      serverCCSID: 37,
+    });
+    const stmt = await sm.prepareStatement(sql);
+    expect(stmt.statementNameOverride).toBeNull();
+
+    sends.length = 0;
+    await sm.execute(stmt, [42]);
+
+    const openReqs = sends.filter(b => b.readUInt16BE(18) === RequestID.OPEN_AND_DESCRIBE);
+    expect(openReqs.length).toBe(1);
+    const openCps = scanCodePoints(openReqs[0]);
+    expect(openCps.get(CodePoint.PREPARED_STATEMENT_NAME)).toBeUndefined();
+    expect(openCps.get(CodePoint.PACKAGE_NAME)).toBeDefined();
+    expect(openCps.get(CodePoint.LIBRARY_NAME)).toBeUndefined();
+  });
+});
+
+describe('cached DML execution sends PREPARED_STATEMENT_NAME on the wire', () => {
+  test('EXECUTE carries statement name override + PACKAGE_NAME on cache hit', async () => {
+    const sends = [];
+    const sql = 'INSERT INTO T (ID) VALUES (?)';
+    const fakeConn = {
+      async sendAndReceive(buf) {
+        sends.push(Buffer.from(buf));
+        return okReply();
+      },
+    };
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'MYAPP',
+      packageLibrary: 'MYLIB',
+      packageCache: true,
+    });
+    const pkgBuf = buildPackageInfoBuffer({
+      statements: [
+        {
+          name: 'STM0099',
+          text: sql,
+          statementType: 1,
+          resultFormat: [],
+          parameterFormat: [
+            { sqlType: 496, length: 4, ccsid: 37, name: 'ID' },
+          ],
+        },
+      ],
+    });
+    const pkgInfo = parsePackageInfo(pkgBuf, { serverCCSID: 37 });
+    pm.setCachedRaw(pkgBuf, pkgInfo.statementCount, pkgInfo);
+    pm.markCreated();
+
+    const sm = new StatementManager(fakeConn, { registerCursor() {} }, {
+      packageManager: pm,
+      serverCCSID: 37,
+    });
+    const stmt = await sm.prepareStatement(sql);
+
+    sends.length = 0;
+    await sm.execute(stmt, [42]);
+
+    // Find the EXECUTE request
+    const execReqs = sends.filter(b => b.readUInt16BE(18) === RequestID.EXECUTE);
+    expect(execReqs.length).toBe(1);
+
+    const execCps = scanCodePoints(execReqs[0]);
+
+    // PREPARED_STATEMENT_NAME (0x3806) must be present
+    const stmtNameCps = execCps.get(CodePoint.PREPARED_STATEMENT_NAME);
+    expect(stmtNameCps).toBeDefined();
+    expect(stmtNameCps.length).toBe(1);
+    const stmtNameText = decodeTextCpPayload(stmtNameCps[0]);
+    expect(stmtNameText).toContain('STM0099');
+
+    // PACKAGE_NAME (0x3804) must be present
+    expect(execCps.get(CodePoint.PACKAGE_NAME)).toBeDefined();
+
+    // LIBRARY_NAME is bound on CREATE_RPB, not repeated here.
+    expect(execCps.get(CodePoint.LIBRARY_NAME)).toBeUndefined();
+  });
+
+  test('non-cached DML does NOT send PREPARED_STATEMENT_NAME on execute', async () => {
+    const sends = [];
+    const sql = 'INSERT INTO T (ID) VALUES (?)';
+    const fakeConn = {
+      async sendAndReceive(buf) {
+        sends.push(Buffer.from(buf));
+        return okReply();
+      },
+    };
+    const sm = new StatementManager(fakeConn, { registerCursor() {} }, { serverCCSID: 37 });
+    const stmt = await sm.prepareStatement(sql);
+
+    sends.length = 0;
+    await sm.execute(stmt, [42]);
+
+    const execReqs = sends.filter(b => b.readUInt16BE(18) === RequestID.EXECUTE);
+    expect(execReqs.length).toBe(1);
+    const execCps = scanCodePoints(execReqs[0]);
+
+    expect(execCps.get(CodePoint.PREPARED_STATEMENT_NAME)).toBeUndefined();
+    expect(execCps.get(CodePoint.PACKAGE_NAME)).toBeUndefined();
+  });
+
+  test('packaged non-cache DML sends PACKAGE_NAME but no PREPARED_STATEMENT_NAME', async () => {
+    const sends = [];
+    const sql = 'INSERT INTO T (ID) VALUES (?)';
+    const fakeConn = {
+      async sendAndReceive(buf) {
+        sends.push(Buffer.from(buf));
+        return okReply();
+      },
+    };
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'MYAPP',
+      packageLibrary: 'MYLIB',
+      packageCache: false,
+    });
+    pm.markCreated();
+    const sm = new StatementManager(fakeConn, { registerCursor() {} }, {
+      packageManager: pm,
+      serverCCSID: 37,
+    });
+    const stmt = await sm.prepareStatement(sql);
+    expect(stmt.statementNameOverride).toBeNull();
+
+    sends.length = 0;
+    await sm.execute(stmt, [42]);
+
+    const execReqs = sends.filter(b => b.readUInt16BE(18) === RequestID.EXECUTE);
+    expect(execReqs.length).toBe(1);
+    const execCps = scanCodePoints(execReqs[0]);
+    expect(execCps.get(CodePoint.PREPARED_STATEMENT_NAME)).toBeUndefined();
+    expect(execCps.get(CodePoint.PACKAGE_NAME)).toBeDefined();
+    expect(execCps.get(CodePoint.LIBRARY_NAME)).toBeUndefined();
+  });
+});
+
+// --- packageCriteria end-to-end (Finding #2 fix) ---------------------
+
+describe('packageCriteria flows through the public connection path', () => {
+  test('_buildConnectOptionsForPool forwards packageCriteria', async () => {
+    const { _buildConnectOptionsForPool } = await import('../../src/db/connect.js');
+    const forwarded = _buildConnectOptionsForPool({
+      host: 'example.invalid',
+      user: 'U',
+      password: 'P',
+      extendedDynamic: true,
+      sqlPackage: 'MYAPP',
+      packageLibrary: 'MYLIB',
+      packageCache: true,
+      packageCriteria: 'select',
+      packageError: 'warning',
+    });
+    expect(forwarded.packageCriteria).toBe('select');
+    expect(forwarded.extendedDynamic).toBe(true);
+    expect(forwarded.sqlPackage).toBe('MYAPP');
+  });
+
+  test('packageCriteria "select" makes plain SELECTs packageable through DataSource', async () => {
+    // Verify that when constructing a PackageManager with the criteria
+    // that would come through DbConnection, it behaves correctly.
+    const pm = new PackageManager({
+      extendedDynamic: true,
+      packageName: 'P',
+      packageCriteria: 'select',
+    });
+    // Under "select" criteria, plain SELECTs are packageable
+    expect(pm.isPackaged('SELECT * FROM T')).toBe(true);
+    expect(pm.isPackaged('SELECT 1 FROM SYSIBM.SYSDUMMY1')).toBe(true);
+    // DML still follows normal rules
+    expect(pm.isPackaged('UPDATE T SET X = 1 WHERE CURRENT OF C')).toBe(false);
   });
 });

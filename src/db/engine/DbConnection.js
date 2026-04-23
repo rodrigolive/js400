@@ -234,6 +234,8 @@ export class DbConnection {
       packageCache: managerOpts.packageCache === true,
       packageName: managerOpts.packageName,
       packageLibrary: managerOpts.packageLibrary,
+      packageCriteria: typeof this.#userOpts?.packageCriteria === 'string'
+        ? this.#userOpts.packageCriteria : undefined,
       errorPolicy: typeof this.#userOpts?.packageError === 'string'
         ? this.#userOpts.packageError : undefined,
       suffixContext,

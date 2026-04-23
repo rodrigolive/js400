@@ -2,8 +2,8 @@
  * Password encryption helpers for all three IBM i password levels.
  *
  * Level 0/1: Custom DES-based encryption (8-byte result)
- * Level 2:   SHA-1 based encryption (20-byte result)
- * Level 3/4: SHA-512 based encryption (64-byte result)
+ * Level 2/3: SHA-1 based encryption (20-byte result)
+ * Level 4:   SHA-512 based encryption (64-byte result)
  *
  * Upstream: EncryptPassword.java, SignonConverter.java
  * @module auth/password-encrypt

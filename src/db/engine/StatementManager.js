@@ -17,7 +17,9 @@ import {
   parseColumnDescriptors, parseExtendedColumnDescriptors,
   parseBasicDataFormat, parseSuperExtendedDataFormat,
   getColumnByteLength,
+  SqlType,
 } from '../protocol/DBDescriptors.js';
+import { parsePackageInfo } from '../protocol/DBPackageInfo.js';
 import { encodeValue, encodeValueInto, decodeResultData, getTypeHandler } from '../types/factory.js';
 import { CharConverter } from '../../ccsid/CharConverter.js';
 
@@ -139,6 +141,21 @@ function getOpenAttributesForSql(sql) {
   return isForUpdateSelect(sql)
     ? OpenAttributes.ALL
     : OpenAttributes.READ_ONLY;
+}
+
+function containsLobDescriptors(descriptors) {
+  for (const desc of descriptors || []) {
+    const absType = Math.abs(desc.sqlType) & 0xFFFE;
+    if (absType === SqlType.BLOB
+      || absType === SqlType.CLOB
+      || absType === SqlType.DBCLOB
+      || absType === SqlType.BLOB_LOCATOR
+      || absType === SqlType.CLOB_LOCATOR
+      || absType === SqlType.DBCLOB_LOCATOR) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function isResizableParameterType(sqlType) {
@@ -310,11 +327,15 @@ export class StatementManager {
     // Thread the connection-level HOLD_INDICATOR when the user asked
     // for holdStatements=true, so cursors survive COMMIT without a
     // reprepare round-trip.
+    const rpbLibraryName = pkg && pkg.isEnabled()
+      ? pkg.getLibraryName()
+      : undefined;
     const createRpbBuf = DBRequestDS.buildCreateRPB({
       rpbId,
       cursorName,
       statementName,
       identifierCcsid: this.#serverCCSID,
+      libraryName: rpbLibraryName,
       openAttributes,
       holdIndicator: this.defaultHoldIndicator ?? undefined,
     });
@@ -324,76 +345,90 @@ export class StatementManager {
 
     // Resolve extended-dynamic package binding for this specific
     // prepare. When the manager is enabled AND the statement is
-    // packageable, JTOpen sends both PACKAGE_NAME (0x3804) and
-    // LIBRARY_NAME (0x3801) alongside a prepareOption=1 ("enhanced"
-    // prepare, which hints that the server may look up / store a
-    // cached plan in the package). When the manager is enabled but
-    // THIS statement is unpackageable, JTOpen sends an empty
-    // PACKAGE_NAME codepoint; we mirror that with `packageName: null`.
+    // packageable, JTOpen sends PACKAGE_NAME (0x3804) alongside a
+    // prepareOption=1 ("enhanced" prepare, which hints that the server
+    // may look up / store a cached plan in the package). The library
+    // is already bound on CREATE_RPB, so the prepare only carries
+    // PACKAGE_NAME. When the manager is enabled but THIS statement is
+    // unpackageable, JTOpen sends an empty PACKAGE_NAME codepoint; we
+    // mirror that with `packageName: null`.
     let packageName;
-    let libraryName;
     let prepareOption = 0;
+    let cachedEntry = null;
     if (pkg && pkg.isEnabled()) {
-      libraryName = pkg.getLibraryName();
       if (pkg.isPackaged(sql)) {
         packageName = pkg.getName();
         prepareOption = 1;
+        if (pkg.isCached()) {
+          cachedEntry = pkg.lookup(sql);
+          const cachedColumns = cachedEntry?.resultDataFormat?.descriptors ?? [];
+          const cachedParams = cachedEntry?.parameterMarkerFormat?.descriptors ?? [];
+          if (cachedEntry && (containsLobDescriptors(cachedColumns) || containsLobDescriptors(cachedParams))) {
+            cachedEntry = null;
+          }
+        }
       } else {
         packageName = null;
       }
     }
 
-    // Prepare and describe with all required attributes (per jtopenlite)
-    const prepBuf = DBRequestDS.buildPrepareAndDescribe({
-      rpbId,
-      sqlText: sql,
-      statementName,
-      identifierCcsid: this.#serverCCSID,
-      statementType,
-      prepareOption,
-      openAttributes,
-      extendedColumnDescriptorOption: 0xF1,
-      parameterMarkerFormat: true,
-      packageName,
-      libraryName,
-    });
-    const prepReplyBuf = await this.#connection.sendAndReceive(prepBuf);
-    const prepReply = parseOperationReply(prepReplyBuf, { serverCCSID: this.#serverCCSID });
-    throwIfError(prepReply.sqlca, 'Prepare');
-
-    // Parse column descriptors from the reply.
-    // Server at DS level 0 returns basic format in CP 0x3805 (DATA_FORMAT).
-    // Higher DS levels may return super extended format in CP 0x3812.
     let columnDescriptors = [];
     let paramDescriptors = [];
-
-    const basicColData = getCodePointData(prepReply, 0x3805);
-    if (basicColData && basicColData.length >= 8) {
-      const parsed = parseBasicDataFormat(basicColData);
-      columnDescriptors = parsed.descriptors;
-    } else {
-      const extDescData = getCodePointData(prepReply, 0x3812);
-      if (extDescData && extDescData.length >= 16) {
-        const parsed = parseSuperExtendedDataFormat(extDescData);
-        columnDescriptors = parsed.descriptors;
-      }
-    }
-
-    // Parse parameter marker descriptors from CP 0x3808 (basic format).
     let paramRecordSize = 0;
     let rawParamFormat = null;
-    const basicParamData = getCodePointData(prepReply, 0x3808);
-    if (basicParamData && basicParamData.length >= 8) {
-      const parsed = parseBasicDataFormat(basicParamData);
-      paramDescriptors = parsed.descriptors;
-      paramRecordSize = parsed.recordSize;
-      rawParamFormat = Buffer.from(basicParamData);
+    let statementNameOverride = null;
+
+    if (!cachedEntry) {
+      // Prepare and describe with all required attributes (per jtopenlite)
+      const prepBuf = DBRequestDS.buildPrepareAndDescribe({
+        rpbId,
+        sqlText: sql,
+        statementName,
+        identifierCcsid: this.#serverCCSID,
+        statementType,
+        prepareOption,
+        openAttributes,
+        extendedColumnDescriptorOption: 0xF1,
+        parameterMarkerFormat: true,
+        packageName,
+      });
+      const prepReplyBuf = await this.#connection.sendAndReceive(prepBuf);
+      const prepReply = parseOperationReply(prepReplyBuf, { serverCCSID: this.#serverCCSID });
+      throwIfError(prepReply.sqlca, 'Prepare');
+
+      const basicColData = getCodePointData(prepReply, 0x3805);
+      if (basicColData && basicColData.length >= 8) {
+        const parsed = parseBasicDataFormat(basicColData);
+        columnDescriptors = parsed.descriptors;
+      } else {
+        const extDescData = getCodePointData(prepReply, 0x3812);
+        if (extDescData && extDescData.length >= 16) {
+          const parsed = parseSuperExtendedDataFormat(extDescData);
+          columnDescriptors = parsed.descriptors;
+        }
+      }
+
+      const basicParamData = getCodePointData(prepReply, 0x3808);
+      if (basicParamData && basicParamData.length >= 8) {
+        const parsed = parseBasicDataFormat(basicParamData);
+        paramDescriptors = parsed.descriptors;
+        paramRecordSize = parsed.recordSize;
+        rawParamFormat = Buffer.from(basicParamData);
+      }
+    } else {
+      statementNameOverride = cachedEntry.statementName || null;
+      columnDescriptors = cachedEntry.resultDataFormat?.descriptors ?? [];
+      paramDescriptors = cachedEntry.parameterMarkerFormat?.descriptors ?? [];
+      paramRecordSize = cachedEntry.parameterMarkerFormat?.recordSize ?? 0;
+      rawParamFormat = null; // Reconstructed from descriptors on first execute
+      pkg.recordHit();
     }
 
     const stmt = {
       rpbId,
       sql,
       statementName,
+      statementNameOverride,
       cursorName,
       openAttributes,
       columnDescriptors,
@@ -408,6 +443,10 @@ export class StatementManager {
       // successive batches have the same field widths.
       lastSentWidths: null,
       closed: false,
+      // Package binding context for the execution path. Packaged
+      // statements always send PACKAGE_NAME. Only cache hits send the
+      // name override, matching JTOpen's `nameOverride_`.
+      packageName: packageName ?? null,
     };
 
     this.#statements.set(rpbId, stmt);
@@ -490,6 +529,11 @@ export class StatementManager {
         openAttributes: stmt.openAttributes ?? OpenAttributes.READ_ONLY,
         blockingFactor,
         requestResultData,
+        // JTOpen nameOverride_ is only sent when the package cache
+        // resolved the statement by name; normal packaged prepares
+        // do not echo the statement name back here.
+        statementName: stmt.statementNameOverride ?? undefined,
+        packageName: stmt.packageName ?? undefined,
       });
 
       const replyBuf = await this.#connection.sendAndReceive(reqBuf);
@@ -569,6 +613,11 @@ export class StatementManager {
       parameterMarkerData,
       pmDescriptorHandle: stmt.descriptorHandle ?? 0,
       requestOutputData,
+      identifierCcsid: this.#serverCCSID,
+      // JTOpen nameOverride_ — only the cache-hit path sends the
+      // prepared statement name on EXECUTE.
+      statementName: stmt.statementNameOverride ?? undefined,
+      packageName: stmt.packageName ?? undefined,
     });
 
     const replyBuf = await this.#connection.sendAndReceive(reqBuf);
@@ -888,11 +937,9 @@ export class StatementManager {
     }
 
     let packageName;
-    let libraryName;
     let prepareOption;
     let statementType;
     if (pkg && pkg.isEnabled()) {
-      libraryName = pkg.getLibraryName();
       if (pkg.isPackaged(sql)) {
         packageName = pkg.getName();
         prepareOption = 1;
@@ -908,7 +955,6 @@ export class StatementManager {
       sqlText: sql,
       identifierCcsid: this.#serverCCSID,
       packageName,
-      libraryName,
       prepareOption,
       statementType,
     });
@@ -1390,10 +1436,9 @@ export class StatementManager {
    * package identity with statement identity on live servers.
    *
    * After a successful create we optionally issue RETURN_PACKAGE when
-   * the user asked for `packageCache`. The raw blob is stored for
-   * later decoding; the cache-hit skip-prepare path is NOT enabled
-   * yet — it requires DBReplyPackageInfo parsing and live-host
-   * qualification.
+   * the user asked for `packageCache`. The reply blob is decoded into
+   * per-statement cache metadata for the skip-prepare path. Live-host
+   * qualification is still pending, but the local wiring is active.
    */
   async #ensurePackageCreated(pkg) {
     const rpbId = pkg.rpbId;
@@ -1448,10 +1493,20 @@ export class StatementManager {
         return;
       }
       // ORS PACKAGE_INFORMATION bit makes the server return a
-      // PACKAGE_INFO codepoint in the reply. We keep the raw bytes
-      // for later decoding; the cache-hit skip-prepare path requires
-      // DBReplyPackageInfo decoding and is deferred to the next pass.
-      pkg.setCachedRaw(replyBuf, 0);
+      // PACKAGE_INFO codepoint (0x380B) in the reply. Decode it so
+      // the cache-hit skip-prepare path can pull statement metadata.
+      const pkgInfoData = getCodePointData(reply, 0x380B);
+      let packageInfo = null;
+      let statementCount = 0;
+      if (pkgInfoData && pkgInfoData.length >= 42) {
+        try {
+          packageInfo = parsePackageInfo(pkgInfoData, { serverCCSID: this.#serverCCSID });
+          statementCount = packageInfo?.statementCount ?? 0;
+        } catch {
+          // Decode failure is non-fatal; fall back to opaque blob.
+        }
+      }
+      pkg.setCachedRaw(replyBuf, statementCount, packageInfo);
     } catch {
       // Silent — cache is opportunistic. Leave created=true so
       // future prepares still carry the package name.

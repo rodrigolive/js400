@@ -46,8 +46,8 @@ const conn = await sql.connect({
   sqlPackage: 'MYAPP',
   packageLibrary: 'QGPL',
 
-  // Optional: pull the package blob down after create. Sets up
-  // the cache-hit skip-prepare path once live qualification lands.
+  // Optional: pull the package blob down after create. Enables
+  // the cache-hit skip-prepare path described below.
   packageCache: true,
 
   // Failure policy: 'none' | 'warning' (default) | 'exception'.
@@ -65,6 +65,7 @@ The full example lives at [`examples/sql-packages.js`](../examples/sql-packages.
 | `sqlPackage` | string | — | Package name. Required when `extendedDynamic=true`; missing/empty disables the manager with a warning-equivalent (`JDError.WARN_EXTENDED_DYNAMIC_DISABLED`). |
 | `packageLibrary` | string | `QGPL` | Library that owns the package. Uppercased. |
 | `packageCache` | boolean | `false` | When true, fires `FUNCTIONID_RETURN_PACKAGE` (`0x1815`) after create and caches the raw reply blob. |
+| `packageCriteria` | `'default'` \| `'select'` | `'default'` | Controls which statements are eligible for the package. `"select"` additionally packages plain `SELECT` statements (no params, no `FOR UPDATE`). See below. |
 | `packageError` | `'none'` \| `'warning'` \| `'exception'` | `'warning'` | Controls what happens when `CREATE_PACKAGE` fails on the wire. See below. |
 | `holdStatements` | boolean | — | Orthogonal. Keeps cursors across commit; often paired with extended-dynamic workloads. |
 
@@ -157,7 +158,7 @@ it still counts as "created" for `isCreated()`. js400 does the same.
 | --- | --- |
 | `packageCreates` | Every successful `FUNCTIONID_CREATE_PACKAGE` round-trip (including SQLCODE -601). |
 | `packageFetches` | Every successful `FUNCTIONID_RETURN_PACKAGE` round-trip when `packageCache=true`. |
-| `packageHits` | Stays at `0` until the cache-hit skip-prepare path lands (see "Open work" below). |
+| `packageHits` | Every time a packageable prepared statement finds a matching entry in the decoded package cache, avoiding a `PREPARE_AND_DESCRIBE` round trip. Stays at `0` when `packageCache=false`. |
 
 Read them via `conn.dbConnection.statementManager.metrics` or through
 the bench harness (`.agent/bench.js` prints them when any is non-zero).
@@ -171,26 +172,80 @@ the bench harness (`.agent/bench.js` prints them when any is non-zero).
 - **First prepare pays once.** When the knob is on, the first
   eligible prepare pays one extra `FUNCTIONID_CREATE_PACKAGE`
   round-trip. Every subsequent prepare attaches the PACKAGE_NAME
-  + LIBRARY_NAME codepoints but does not re-create.
+  codepoint but does not re-create. On `prepareStatement()`, the
+  statement RPB also binds `LIBRARY_NAME` once via `CREATE_RPB`,
+  matching JTOpen.
 - **`packageCreates = 1` is not a speed win by itself** — it's an
-  extra round-trip. The real win happens once the server starts
-  reusing cached access plans across connections with the same
-  package name, and (when it lands) once the skip-prepare path
-  bypasses `PREPARE_AND_DESCRIBE` for cached statements.
+  extra round-trip. The real win happens when the server reuses
+  cached access plans across connections with the same package
+  name, and (when `packageCache=true`) the skip-prepare path
+  bypasses `PREPARE_AND_DESCRIBE` for cached statements, saving
+  one full round trip per hit.
 
-## Open work (deferred, tracked in `.agent/DB2-AGENT-GAP-REPORT.md`)
+## Cache-hit skip-prepare
 
-1. **`DBReplyPackageInfo` decode + `packageHits` skip-prepare.**
-   Needs live-host evidence against a real DB2 for i before it's
-   worth implementing, because the `DBReplyPackageInfo` layout is
-   server-version-dependent.
-2. **`packageCriteria` property.** JTOpen defaults to `"default"`,
-   which is already what js400 emits; the `"select"` variant that
-   adds plain SELECTs to the packageable set is unimplemented.
-3. **Live-host qualification** of the whole flow against a real
-   server.
+When `packageCache=true`, js400 decodes the `DBReplyPackageInfo`
+blob (reply code point `0x380B`) returned by `FUNCTIONID_RETURN_PACKAGE`
+and stores per-statement metadata: statement name, SQL text, result
+format, and parameter-marker format. On subsequent `prepareStatement()`
+calls for the same SQL text, js400 performs a length-first then
+full-string comparison against the cached entries (mirroring
+`JDPackageManager.getCachedStatementIndex`). On a hit:
 
-None of these affect callers who use the feature today — packages
-are created, per-prepare binding works, and the failure policy is
-honored; what's deferred is the final hop that lets the client
-**skip** a prepare entirely when the cached plan is already there.
+- `PREPARE_AND_DESCRIBE` is **not** sent — the round trip is skipped.
+- `CREATE_RPB` still happens (the server needs a valid handle).
+- The prepared statement keeps its local `statementName`, stores the
+  package statement name as an execute-time override, and populates
+  `columnDescriptors`, `paramDescriptors`, `paramRecordSize`, and
+  `rawParamFormat` from the cached package metadata.
+- `packageHits` increments exactly once.
+
+**Execution of cached statements.** When `execute()` runs a
+cache-hit statement, the subsequent `OPEN_AND_DESCRIBE` (SELECT) or
+`EXECUTE` (DML) request carries two additional code points that
+are absent on the non-cached path:
+
+- `PREPARED_STATEMENT_NAME` (`0x3806`) — the cached statement name
+  from the package, so the server can resolve the cached access plan.
+- `PACKAGE_NAME` (`0x3804`) — the package that holds the statement.
+
+This mirrors JTOpen's `nameOverride_` pattern in
+`AS400JDBCStatement.commonExecute` (line 879). The package library is
+already bound on `CREATE_RPB`, so it is not repeated on `OPEN` /
+`EXECUTE`. Tests verify the wire shape for both cached and non-cached
+SELECT / DML paths.
+
+**LOB guard.** If the cached result or parameter format contains
+LOB or locator types (`BLOB`, `CLOB`, `DBCLOB`, `BLOB_LOCATOR`,
+`CLOB_LOCATOR`, `DBCLOB_LOCATOR`), js400 falls back to a normal
+`PREPARE_AND_DESCRIBE` instead of reusing the cached entry. This
+mirrors JTOpen's defensive behavior — LOB descriptors from a
+package cache may not reflect the live session's locator state.
+
+**Fallback.** If the package info blob is malformed, if the decode
+fails, or if the SQL is not found in the cache, js400 falls back
+to the normal prepare path without incrementing `packageHits`.
+
+## packageCriteria
+
+JTOpen's `JDSQLStatement` accepts a `packageCriteria` property:
+
+| Value | Effect |
+| --- | --- |
+| `"default"` (default) | Only the standard `isPackaged` rule: parameterized statements, `INSERT...SELECT`, `SELECT...FOR UPDATE`, and `DECLARE CURSOR`. |
+| `"select"` | Additionally packages plain `SELECT` statements (no `FOR UPDATE`, no parameters). Useful when the app runs many read-only SELECTs and wants them cached. |
+
+js400 exposes `packageCriteria` on `connect()` / `createPool()` /
+`DataSource` options and threads it through `DbConnection` into
+`PackageManager.isPackaged()`. The property is included in the
+`buildConnectOptions` whitelist so pooled connections receive it.
+
+## Open work
+
+1. **Live-host qualification** of the full skip-prepare flow against a
+   real DB2 for i server. The `DBReplyPackageInfo` decode is
+   implemented against the JTOpen layout but has not been tested with
+   live wire data. Edge cases around V5R1+ Unicode text-length
+   doubling are auto-detected from the cached blob.
+2. **Cancel live qualification** — the previous cancel pass still needs
+   real DB2 for i verification.

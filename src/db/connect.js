@@ -121,7 +121,7 @@ function buildConnectOptions(options) {
     'translateBinary', 'translateHex',
     // Extended dynamic / SQL packages.
     'extendedDynamic', 'sqlPackage', 'packageLibrary', 'packageCache',
-    'packageError',
+    'packageCriteria', 'packageError',
     // Sort sequence.
     'sortType', 'sortLanguage', 'sortTable', 'sortWeight', 'sortSequence',
   ];

@@ -201,7 +201,7 @@ describe('encryptPasswordSHA1', () => {
   });
 });
 
-// ── SHA-512 Encryption (Level 3/4) ──────────────────────────────────
+// ── SHA-512 Encryption (Level 4) ────────────────────────────────────
 
 describe('encryptPasswordSHA512', () => {
   test('produces 64-byte result', () => {
@@ -263,12 +263,12 @@ describe('encryptPassword', () => {
     expect(result.length).toBe(20);
   });
 
-  test('dispatches to SHA-512 for level 3', () => {
+  test('dispatches to SHA-1 for level 3', () => {
     const result = encryptPassword({
       userId: 'MYUSER', password: 'MYPASS',
       clientSeed, serverSeed, passwordLevel: 3,
     });
-    expect(result.length).toBe(64);
+    expect(result.length).toBe(20);
   });
 
   test('dispatches to SHA-512 for level 4', () => {

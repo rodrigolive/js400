@@ -679,21 +679,16 @@ export class DBRequestDS {
     if (opts.describeOption != null) cps.push(buildByteCP(CodePoint.DESCRIBE_OPTION, opts.describeOption));
     if (opts.extendedColumnDescriptorOption != null) cps.push(buildByteCP(CodePoint.EXTENDED_COLUMN_DESC_OPTION, opts.extendedColumnDescriptorOption));
     // Extended-dynamic package binding: when a caller asks us to store
-    // this statement in a server-side SQL package, attach the package
-    // + library codepoints to the PREPARE request. JTOpen sends these
-    // from AS400JDBCStatement#commonPrepare via
-    // `setPackageName`/`setLibraryName` whenever packageManager is
-    // enabled AND the statement is packageable. A null packageName
-    // sends the "empty" CP, which is how JTOpen tells the server
-    // "this specific statement is not eligible for the package" even
-    // though the RPB's library is still bound.
+    // this statement in a server-side SQL package, attach PACKAGE_NAME
+    // to the PREPARE request. The library is already bound on
+    // CREATE_RPB, so PREPARE only repeats the package name. A null
+    // packageName sends the "empty" CP, which is how JTOpen tells the
+    // server "this specific statement is not eligible for the package"
+    // even though the RPB's library is still bound.
     if (opts.packageName === null) {
       cps.push(buildEmptyCP(CodePoint.PACKAGE_NAME));
     } else if (typeof opts.packageName === 'string' && opts.packageName.length > 0) {
       cps.push(buildTextCP(CodePoint.PACKAGE_NAME, opts.packageName, identifierCcsid));
-    }
-    if (typeof opts.libraryName === 'string' && opts.libraryName.length > 0) {
-      cps.push(buildTextCP(CodePoint.LIBRARY_NAME, opts.libraryName, identifierCcsid));
     }
     if (opts.translateIndicator != null) cps.push(buildByteCP(CodePoint.TRANSLATE_INDICATOR, opts.translateIndicator));
 
@@ -897,6 +892,13 @@ export class DBRequestDS {
    */
   static buildExecute(opts) {
     const cps = [];
+    const identifierCcsid = opts.identifierCcsid ?? UNICODE_CCSID;
+    // JTOpen AS400JDBCStatement.java:879 — cached statement name must
+    // accompany the EXECUTE so the server resolves the cached plan.
+    if (opts.statementName) cps.push(buildTextCP(CodePoint.PREPARED_STATEMENT_NAME, opts.statementName, identifierCcsid));
+    // Packaged execution repeats PACKAGE_NAME. The library is already
+    // bound on CREATE_RPB.
+    if (opts.packageName) cps.push(buildTextCP(CodePoint.PACKAGE_NAME, opts.packageName, identifierCcsid));
     // Per JTOpen: send PARAMETER_MARKER_BLOCK_IND before parameter data
     if (opts.parameterMarkerData) {
       cps.push(buildShortCP(CodePoint.PARAMETER_MARKER_BLOCK_IND, opts.statementType ?? 0));
@@ -940,6 +942,14 @@ export class DBRequestDS {
     if (opts.openAttributes != null) cps.push(buildByteCP(CodePoint.OPEN_ATTRIBUTES, opts.openAttributes));
     if (opts.scrollable != null) cps.push(buildByteCP(CodePoint.SCROLLABLE_CURSOR_FLAG, opts.scrollable));
     if (opts.cursorName) cps.push(buildTextCP(CodePoint.CURSOR_NAME, opts.cursorName, identifierCcsid));
+    // JTOpen AS400JDBCStatement.java:879 — when executing a cached
+    // statement from a package, the prepared statement name must be sent
+    // so the server can resolve the cached access plan. Without this,
+    // the server treats the request as a fresh unnamed open and fails.
+    if (opts.statementName) cps.push(buildTextCP(CodePoint.PREPARED_STATEMENT_NAME, opts.statementName, identifierCcsid));
+    // Packaged execution repeats PACKAGE_NAME. The library is already
+    // bound on CREATE_RPB.
+    if (opts.packageName) cps.push(buildTextCP(CodePoint.PACKAGE_NAME, opts.packageName, identifierCcsid));
     // Include inline parameter format (0x3801) if provided
     if (opts.parameterMarkerFormat) cps.push(buildRawCP(0x3801, opts.parameterMarkerFormat));
     // Parameter marker data
@@ -1049,7 +1059,7 @@ export class DBRequestDS {
    * Build execute-immediate request (prepare + execute in one step).
    *
    * Mirrors JTOpen `AS400JDBCStatement` immediate-execute path,
-   * which also attaches PACKAGE_NAME / LIBRARY_NAME / PREPARE_OPTION
+   * which attaches PACKAGE_NAME / PREPARE_OPTION
    * when the connection's package manager is enabled. Passing
    * `packageName: null` emits the empty PACKAGE_NAME codepoint that
    * JTOpen uses to tell the server "this statement is not eligible
@@ -1061,7 +1071,6 @@ export class DBRequestDS {
    * @param {number} [opts.statementType]
    * @param {number} [opts.prepareOption]
    * @param {string|null} [opts.packageName]
-   * @param {string} [opts.libraryName]
    * @param {number} [opts.identifierCcsid]
    * @param {number} [opts.translateIndicator]
    * @returns {Buffer}
@@ -1075,9 +1084,6 @@ export class DBRequestDS {
       cps.push(buildEmptyCP(CodePoint.PACKAGE_NAME));
     } else if (typeof opts.packageName === 'string' && opts.packageName.length > 0) {
       cps.push(buildTextCP(CodePoint.PACKAGE_NAME, opts.packageName, identifierCcsid));
-    }
-    if (typeof opts.libraryName === 'string' && opts.libraryName.length > 0) {
-      cps.push(buildTextCP(CodePoint.LIBRARY_NAME, opts.libraryName, identifierCcsid));
     }
     if (opts.translateIndicator != null) cps.push(buildByteCP(CodePoint.TRANSLATE_INDICATOR, opts.translateIndicator));
 

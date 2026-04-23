@@ -60,6 +60,28 @@ export function expect(actual) {
   return new Expectation(actual);
 }
 
+function assertPartialDeepStrictEqual(actual, expected, path = 'value') {
+  if (Array.isArray(expected)) {
+    assert.ok(Array.isArray(actual), `Expected ${path} to be an array`);
+    assert.ok(actual.length >= expected.length, `Expected ${path} length >= ${expected.length}`);
+    for (let i = 0; i < expected.length; i += 1) {
+      assertPartialDeepStrictEqual(actual[i], expected[i], `${path}[${i}]`);
+    }
+    return;
+  }
+
+  if (expected && typeof expected === 'object') {
+    assert.ok(actual && typeof actual === 'object', `Expected ${path} to be an object`);
+    for (const key of Object.keys(expected)) {
+      assert.ok(key in Object(actual), `Expected ${path} to have property "${key}"`);
+      assertPartialDeepStrictEqual(actual[key], expected[key], `${path}.${key}`);
+    }
+    return;
+  }
+
+  assert.deepStrictEqual(actual, expected);
+}
+
 class Expectation {
   #actual;
   #not = false;
@@ -87,6 +109,20 @@ class Expectation {
       assert.notDeepStrictEqual(this.#actual, expected);
     } else {
       assert.deepStrictEqual(this.#actual, expected);
+    }
+  }
+
+  toMatchObject(expected) {
+    if (this.#not) {
+      let matched = true;
+      try {
+        assertPartialDeepStrictEqual(this.#actual, expected);
+      } catch {
+        matched = false;
+      }
+      assert.ok(!matched, 'Expected value not to match object');
+    } else {
+      assertPartialDeepStrictEqual(this.#actual, expected);
     }
   }
 
@@ -284,6 +320,10 @@ class Expectation {
     toEqual: async (expected) => {
       const result = await this.#actual;
       assert.deepStrictEqual(result, expected);
+    },
+    toBeDefined: async () => {
+      const result = await this.#actual;
+      assert.notStrictEqual(result, undefined);
     },
   };
 

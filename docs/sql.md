@@ -246,3 +246,21 @@ await conn.close();
 ```
 
 Source: [`src/db/connect.js`](../src/db/connect.js), [`src/db/api/Connection.js`](../src/db/api/Connection.js), [`src/db/api/PreparedStatement.js`](../src/db/api/PreparedStatement.js), [`src/db/properties.js`](../src/db/properties.js)
+
+## JTOpen parity addendum
+
+The SQL client is already usable, but it is not yet a complete
+one-for-one replacement for the full JTOpen JDBC surface.
+
+- Full `getMoreResults()` streaming across multiple host result sets is
+  still partial.
+- Updatable result sets and sensitive server-side scrollable cursors are
+  not implemented.
+- Some JDBC-style metadata and type edges are still being filled in.
+- Some compatibility properties are stored for API parity but do not yet
+  change runtime behavior, especially prefetch-related and reroute
+  settings.
+- SQL package caching and wire-level cancel are implemented, but more
+  live IBM i qualification is still pending.
+
+For the maintained detail, see [SQL Feature Matrix](./sql-feature-matrix.md).

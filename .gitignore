@@ -1,2 +1,4 @@
 .agent/*
 JTOpen/
+.opencode/*
+.claude/*

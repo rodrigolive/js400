@@ -166,3 +166,22 @@ await system.close();
 - [Tracing](./tracing.md) -- diagnostic tracing and hex dumps
 
 Source: [`src/core/AS400.js`](../src/core/AS400.js), [`src/db/connect.js`](../src/db/connect.js)
+
+## JTOpen parity addendum
+
+`js400` is a protocol-focused port of JTOpen, but it is not yet
+fully equiparable to every JTOpen package and JDBC edge case.
+
+- Java-only families such as proxy/RMI layers, GUI dialogs, JNDI/JTA/XA,
+  RowSet, and BeanInfo metadata are intentionally not part of js400.
+- The core IBM i paths are here, but some SQL/JDBC features are still
+  partial, especially full multi-result-set streaming, updatable or
+  sensitive result sets, and a few metadata/type edges.
+- Some compatibility properties are accepted but not fully active at
+  runtime yet, especially prefetch-related and reroute settings.
+- Some newer JTOpen-faithful wire paths still need more live-host
+  validation on real IBM i systems, especially package-cache reuse and
+  wire cancel.
+
+For the maintained detail, see [SQL Feature Matrix](./sql-feature-matrix.md)
+and [Unsupported or Redesigned Upstream Surface](./unsupported.md).

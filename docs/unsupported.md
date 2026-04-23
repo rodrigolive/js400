@@ -6,6 +6,20 @@ This document is the maintained ledger for JTOpen families that `js400` intentio
 
 `js400` compatibility means protocol parity, recognizable public class names where useful, and familiar IBM i concepts. It does not mean mirroring every deprecated Java package, carrying JavaBeans-era metadata, or recreating proxy and GUI layers that do not fit Node or Bun.
 
+## Short parity summary
+
+If you only need the short version, the main reasons `js400` is not yet
+fully equiparable to JTOpen are:
+
+- Java-only upstream families are intentionally omitted:
+  proxy/RMI, GUI dialogs, JNDI/JTA/XA, RowSet, BeanInfo, and similar JVM
+  scaffolding.
+- The core IBM i client surface is present, but a few SQL/JDBC features
+  are still partial or staged.
+- Some compatibility properties are accepted before their runtime effect
+  is fully implemented.
+- A few JTOpen-faithful wire paths still need more live-host validation.
+
 ## Dropped and deferred upstream families
 
 | Upstream package or family | Status | js400 outcome | Rationale |

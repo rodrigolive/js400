@@ -692,7 +692,10 @@ export class DBRequestDS {
     }
     if (opts.translateIndicator != null) cps.push(buildByteCP(CodePoint.TRANSLATE_INDICATOR, opts.translateIndicator));
 
-    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT;
+    // JTOpen's PREPARE_DESCRIBE ORS defaults to RETURN_DATA + DATA_FORMAT
+    // + SQLCA + PARAMETER_MARKER_FORMAT. Extended column descriptors are
+    // only requested when explicitly enabled.
+    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT | ORSBitmap.SQLCA;
     if (opts.extendedColumnDescriptorOption != null) orsBitmap |= ORSBitmap.EXTENDED_COLUMN_DESCRIPTORS;
     if (opts.parameterMarkerFormat === true) orsBitmap |= ORSBitmap.PARAMETER_MARKER_FORMAT;
 

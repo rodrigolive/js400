@@ -388,7 +388,6 @@ export class StatementManager {
         statementType,
         prepareOption,
         openAttributes,
-        extendedColumnDescriptorOption: 0xF1,
         parameterMarkerFormat: true,
         packageName,
       });
@@ -495,7 +494,15 @@ export class StatementManager {
     // - OPEN_AND_DESCRIBE (0x1804) for SELECT (opens cursor)
     // - EXECUTE (0x1805) for DML (INSERT/UPDATE/DELETE)
     // It does NOT use EXECUTE_OR_OPEN_DESCRIBE (0x1812).
-    const isSelect = stmt.columnDescriptors.length > 0;
+    //
+    // Detect SELECT via column descriptors OR the SQL keyword. The server
+    // may defer the column format for wide result sets (e.g. SELECT * on
+    // tables with 30+ columns), returning an empty 0x3805 code point at
+    // PREPARE time and deferring the actual format to OPEN. In that case
+    // columnDescriptors is empty, but we still must use OPEN_AND_DESCRIBE
+    // — using EXECUTE on a SELECT causes SQLCODE -518.
+    const isSelect = stmt.columnDescriptors.length > 0
+      || inferStatementType(stmt.sql) === StatementType.SELECT;
 
     if (isSelect) {
       // SELECT: open cursor via OPEN_AND_DESCRIBE.
@@ -524,6 +531,7 @@ export class StatementManager {
       const reqBuf = DBRequestDS.buildOpenAndDescribe({
         rpbId: stmt.rpbId,
         parameterMarkerData,
+        parameterMarkerFormat: stmt.rawParamFormat ?? undefined,
         pmDescriptorHandle: stmt.descriptorHandle ?? 0,
         identifierCcsid: this.#serverCCSID,
         openAttributes: stmt.openAttributes ?? OpenAttributes.READ_ONLY,

@@ -323,25 +323,24 @@ describe('DBRequestDS', () => {
 
   describe('RequestID constants', () => {
     test('expected values', () => {
-      expect(RequestID.EXCHANGE_ATTRIBUTES).toBe(0x1001);
-      expect(RequestID.CREATE_RPB).toBe(0x1800);
-      expect(RequestID.PREPARE_AND_DESCRIBE).toBe(0x180A);
-      expect(RequestID.EXECUTE_OR_OPEN_DESCRIBE).toBe(0x180E);
-      expect(RequestID.COMMIT).toBe(0x180F);
-      expect(RequestID.ROLLBACK).toBe(0x1810);
-      expect(RequestID.FETCH).toBe(0x1807);
-      expect(RequestID.CLOSE_CURSOR).toBe(0x1808);
-      expect(RequestID.EXECUTE_IMMEDIATE).toBe(0x1809);
-      expect(RequestID.RETRIEVE_LOB_DATA).toBe(0x1815);
-      expect(RequestID.FREE_LOB).toBe(0x1820);
+      expect(RequestID.CREATE_RPB).toBe(0x1D00);
+      expect(RequestID.PREPARE_AND_DESCRIBE).toBe(0x1803);
+      expect(RequestID.EXECUTE_OR_OPEN_DESCRIBE).toBe(0x1812);
+      expect(RequestID.COMMIT).toBe(0x1807);
+      expect(RequestID.ROLLBACK).toBe(0x1808);
+      expect(RequestID.FETCH).toBe(0x180B);
+      expect(RequestID.CLOSE_CURSOR).toBe(0x180A);
+      expect(RequestID.EXECUTE_IMMEDIATE).toBe(0x1806);
+      expect(RequestID.RETRIEVE_LOB_DATA).toBe(0x1816);
+      expect(RequestID.FREE_LOB).toBe(0x1819);
     });
   });
 
   describe('CodePoint constants', () => {
     test('expected values', () => {
-      expect(CodePoint.SQL_STATEMENT_TEXT).toBe(0x3801);
+      expect(CodePoint.SQL_STATEMENT_TEXT).toBe(0x3807);
       expect(CodePoint.PARAMETER_MARKER_DATA).toBe(0x3811);
-      expect(CodePoint.EXTENDED_COLUMN_DESCRIPTORS).toBe(0x3812);
+      expect(CodePoint.STATEMENT_TYPE).toBe(0x3812);
       expect(CodePoint.BLOCKING_FACTOR).toBe(0x380C);
       expect(CodePoint.DESCRIBE_OPTION).toBe(0x380A);
       expect(CodePoint.TRANSLATE_INDICATOR).toBe(0x3805);

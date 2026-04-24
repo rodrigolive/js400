@@ -57,6 +57,7 @@ export async function connect(systemOrUrl, opts = {}) {
     });
     await system.signon();
     const normalized = normalizeProperties(connOpts);
+    normalized._ownsSystem = true;
     const db = new DbConnection(system, normalized, connOpts);
     await db.connect();
     return new Connection(db);

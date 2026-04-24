@@ -48,6 +48,7 @@ export class DbConnection {
   #cancelChannel;
   #cancelChannelPromise;
   #cancelMetrics;
+  #ownsSystem;
 
   /**
    * @param {import('../../core/AS400.js').AS400} system - authenticated AS400 instance
@@ -67,6 +68,7 @@ export class DbConnection {
    */
   constructor(system, opts = {}, rawOpts = opts) {
     this.#system = system;
+    this.#ownsSystem = opts._ownsSystem ?? false;
     this.#properties = { ...defaultProperties, ...opts };
     // Retain the pre-normalization opts bag so engine-level knobs that
     // should only fire on explicit opt-in (e.g. holdStatements,
@@ -570,6 +572,19 @@ export class DbConnection {
       try { await this.#cancelChannel.close(); } catch { /* ignore */ }
     }
     this.#cancelChannel = null;
+
+    // Close the database host-server socket so the event loop can drain.
+    if (this.#connection && typeof this.#connection.close === 'function') {
+      try { this.#connection.close(); } catch { /* ignore */ }
+    }
+    this.#connection = null;
+
+    // If this DbConnection created the AS400 system internally
+    // (pool / options-based connect), close it to release the signon socket.
+    if (this.#ownsSystem && this.#system) {
+      try { await this.#system.close(); } catch { /* ignore */ }
+    }
+    this.#system = null;
 
     this.#connected = false;
     Trace.log(Trace.JDBC, 'Database connection closed');

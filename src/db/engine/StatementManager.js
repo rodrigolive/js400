@@ -532,7 +532,7 @@ export class StatementManager {
       //
       // js400 intentionally keeps the default read-only SELECT path on the
       // pure open + later FETCH flow, even for read-only cursors. A live-host
-      // qualification pass against a live IBM i host showed that requesting inline first
+      // qualification pass against a live host showed that requesting inline first
       // block data with OPEN_DESCRIBE_FETCH (0x180E) produced empty or
       // corrupted singleton/catalog rows on real IBM i queries, while plain
       // OPEN_AND_DESCRIBE (0x1804) followed by FETCH returned correct data.
@@ -803,7 +803,7 @@ export class StatementManager {
     }
 
     // Pass 1: determine per-column width for resizable types. We do
-    // this WITHOUT fully encoding — for single-byte CCSIDs (the a live IBM i host
+    // this WITHOUT fully encoding — for single-byte CCSIDs (the common
     // default CCSID 37 case), byte length equals char length, so a
     // plain `String(v).length` scan suffices. For UTF-8 we delegate to
     // Buffer.byteLength, and for UTF-16 it's 2 × char count.

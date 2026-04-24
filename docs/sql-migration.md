@@ -127,7 +127,7 @@ Some properties are now runtime-wired; others are still accepted only for config
 
 | JDBC property | js400 option | Notes |
 | --- | --- | --- |
-| `block size` | `blockSize` | Runtime-wired when explicitly set. js400 now computes a JTOpen-style row-count blocking factor from row length (`floor(blockSizeKB * 1024 / rowLength)`, capped to `32767`) and uses that for the OPEN request plus the default FETCH size when the caller did not set `Statement.setFetchSize()`. The knob remains opt-in only; default callers keep js400's existing fetch behavior. Live a live IBM i host qualification showed `blockSize=32` was materially slower on the current wide-row benchmark, so this is parity behavior, not a recommended default. |
+| `block size` | `blockSize` | Runtime-wired when explicitly set. js400 now computes a JTOpen-style row-count blocking factor from row length (`floor(blockSizeKB * 1024 / rowLength)`, capped to `32767`) and uses that for the OPEN request plus the default FETCH size when the caller did not set `Statement.setFetchSize()`. The knob remains opt-in only; default callers keep js400's existing fetch behavior. Live live IBM i qualification showed `blockSize=32` was materially slower on the current wide-row benchmark, so this is parity behavior, not a recommended default. |
 | `prefetch` | `prefetch` | Stored only. js400 currently uses the correctness-first `OPEN_AND_DESCRIBE` + `FETCH` path by default; inline first-block prefetch via `OPEN_DESCRIBE_FETCH` is deferred until it is re-qualified against live hosts. |
 | `extended dynamic` | `extendedDynamic` | Stored only. No server-side SQL package integration yet. |
 | `lazy close` | `lazyClose` | Stored only. Handles already defer via the statement cache; no wire-level lazy close yet. |

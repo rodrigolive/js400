@@ -95,5 +95,10 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/rodrigolive/js400.git"
-  }
+  },
+  "homepage": "https://github.com/rodrigolive/js400#readme",
+  "bugs": {
+    "url": "https://github.com/rodrigolive/js400/issues"
+  },
+  "author": "Rodrigo Gonzalez"
 }

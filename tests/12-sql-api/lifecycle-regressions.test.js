@@ -345,7 +345,7 @@ describe('Connection.prepare reuses cached handle after close', () => {
   });
 
   test('cached prepared SELECT closes cursor before release (no -502 on reuse)', async () => {
-    // Models the real host behavior that bit us on a live IBM i host: a cached
+    // Models the real host behavior observed in live testing: a cached
     // prepared SELECT whose cursor was left open on the server fails
     // the next execute with SQLCODE -502 ("cursor already open"). We
     // simulate that by tracking open cursor state and having the

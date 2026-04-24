@@ -13949,6 +13949,7 @@ var CodePoint = Object.freeze({
   HOLD_INDICATOR: 14351,
   REUSE_INDICATOR: 14352,
   PARAMETER_MARKER_DATA: 14353,
+  EXTENDED_PARAMETER_MARKER_DATA: 14367,
   STATEMENT_TYPE: 14354,
   PARAMETER_MARKER_BLOCK_IND: 14356,
   RETURN_SIZE: 14357,
@@ -14046,13 +14047,13 @@ function buildTextCP(cp, text, ccsid147 = UNICODE_CCSID) {
   textBuf.copy(buf, 10);
   return buf;
 }
-function buildExtTextCP(cp, text) {
-  const textBuf = encodeUtf16BE(text);
+function buildExtTextCP(cp, text, ccsid147 = UNICODE_CCSID) {
+  const textBuf = ccsid147 === UNICODE_CCSID ? encodeUtf16BE(text) : CharConverter.stringToByteArray(text, ccsid147);
   const ll = 12 + textBuf.length;
   const buf = Buffer.alloc(ll);
   buf.writeInt32BE(ll, 0);
   buf.writeUInt16BE(cp, 4);
-  buf.writeUInt16BE(UNICODE_CCSID, 6);
+  buf.writeUInt16BE(ccsid147, 6);
   buf.writeInt32BE(textBuf.length, 8);
   textBuf.copy(buf, 12);
   return buf;
@@ -14136,7 +14137,8 @@ class DBRequestDS {
       buildShortCP(CodePoint.BLOCKING_FACTOR, opts.namingConvention ?? 0),
       buildByteCP(CodePoint.TRANSLATE_INDICATOR, opts.translateIndicator ?? 1),
       buildShortCP(CodePoint.SQL_STATEMENT_TEXT, opts.dateFormat ?? 5),
-      buildIntCP(CodePoint.CLIENT_DATASTREAM_LEVEL, dsLevel)
+      buildIntCP(CodePoint.CLIENT_DATASTREAM_LEVEL, dsLevel),
+      buildByteCP(14369, opts.extendedFormats ?? 242)
     ];
     const template = Buffer.alloc(TEMPLATE_LENGTH);
     writeTemplate(template, 0, {
@@ -14236,7 +14238,7 @@ class DBRequestDS {
     if (opts.statementName) {
       cps.push(buildTextCP(CodePoint.PREPARED_STATEMENT_NAME, opts.statementName, opts.identifierCcsid ?? UNICODE_CCSID));
     }
-    cps.push(buildExtTextCP(CodePoint.EXTENDED_SQL_STATEMENT_TEXT, opts.sqlText));
+    cps.push(buildExtTextCP(CodePoint.EXTENDED_SQL_STATEMENT_TEXT, opts.sqlText, opts.statementTextCcsid ?? UNICODE_CCSID));
     if (opts.prepareOption != null)
       cps.push(buildByteCP(CodePoint.PREPARE_OPTION, opts.prepareOption));
     if (opts.translateIndicator != null)
@@ -14255,7 +14257,7 @@ class DBRequestDS {
     if (opts.statementName) {
       cps.push(buildTextCP(CodePoint.PREPARED_STATEMENT_NAME, opts.statementName, identifierCcsid));
     }
-    cps.push(buildExtTextCP(CodePoint.EXTENDED_SQL_STATEMENT_TEXT, opts.sqlText));
+    cps.push(buildExtTextCP(CodePoint.EXTENDED_SQL_STATEMENT_TEXT, opts.sqlText, opts.statementTextCcsid ?? UNICODE_CCSID));
     if (opts.statementType != null)
       cps.push(buildShortCP(CodePoint.STATEMENT_TYPE, opts.statementType));
     if (opts.prepareOption != null)
@@ -14273,8 +14275,9 @@ class DBRequestDS {
     }
     if (opts.translateIndicator != null)
       cps.push(buildByteCP(CodePoint.TRANSLATE_INDICATOR, opts.translateIndicator));
-    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT;
-    if (opts.extendedColumnDescriptorOption != null)
+    const isCall = opts.statementType === 3;
+    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT | ORSBitmap.SQLCA;
+    if (!isCall)
       orsBitmap |= ORSBitmap.EXTENDED_COLUMN_DESCRIPTORS;
     if (opts.parameterMarkerFormat === true)
       orsBitmap |= ORSBitmap.PARAMETER_MARKER_FORMAT;
@@ -14327,7 +14330,8 @@ class DBRequestDS {
     buf.writeInt16BE(opts.statementType ?? 0, cpOff + 6);
     cpOff += blockIndCpLen;
     buf.writeInt32BE(pmCpLen, cpOff);
-    buf.writeUInt16BE(CodePoint.PARAMETER_MARKER_DATA, cpOff + 4);
+    const pmCp = (opts.pmDescriptorHandle ?? 0) !== 0 ? CodePoint.EXTENDED_PARAMETER_MARKER_DATA : CodePoint.PARAMETER_MARKER_DATA;
+    buf.writeUInt16BE(pmCp, cpOff + 4);
     const paramDataOffset = cpOff + pmCpHeaderLen;
     return { buffer: buf, paramDataOffset };
   }
@@ -14374,10 +14378,9 @@ class DBRequestDS {
       cps.push(buildTextCP(CodePoint.PACKAGE_NAME, opts.packageName, identifierCcsid));
     if (opts.parameterMarkerData) {
       cps.push(buildShortCP(CodePoint.PARAMETER_MARKER_BLOCK_IND, opts.statementType ?? 0));
-      cps.push(buildRawCP(CodePoint.PARAMETER_MARKER_DATA, opts.parameterMarkerData));
+      const pmCp = opts.pmDescriptorHandle ? CodePoint.EXTENDED_PARAMETER_MARKER_DATA : CodePoint.PARAMETER_MARKER_DATA;
+      cps.push(buildRawCP(pmCp, opts.parameterMarkerData));
     }
-    if (opts.extendedParameterData)
-      cps.push(buildRawCP(CodePoint.EXTENDED_COLUMN_DESCRIPTORS, opts.extendedParameterData));
     let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA;
     if (opts.requestOutputData)
       orsBitmap |= ORSBitmap.RESULT_DATA;
@@ -14407,16 +14410,16 @@ class DBRequestDS {
       cps.push(buildTextCP(CodePoint.PREPARED_STATEMENT_NAME, opts.statementName, identifierCcsid));
     if (opts.packageName)
       cps.push(buildTextCP(CodePoint.PACKAGE_NAME, opts.packageName, identifierCcsid));
-    if (opts.parameterMarkerFormat)
-      cps.push(buildRawCP(14337, opts.parameterMarkerFormat));
     if (opts.parameterMarkerData) {
-      cps.push(buildRawCP(CodePoint.PARAMETER_MARKER_DATA, opts.parameterMarkerData));
+      cps.push(buildShortCP(CodePoint.PARAMETER_MARKER_BLOCK_IND, opts.statementType ?? 0));
+      const pmCp = opts.pmDescriptorHandle ? CodePoint.EXTENDED_PARAMETER_MARKER_DATA : CodePoint.PARAMETER_MARKER_DATA;
+      cps.push(buildRawCP(pmCp, opts.parameterMarkerData));
     }
     const template = Buffer.alloc(TEMPLATE_LENGTH);
-    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA | ORSBitmap.MESSAGE_ID | ORSBitmap.FIRST_LEVEL_TEXT | ORSBitmap.SECOND_LEVEL_TEXT;
+    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT | ORSBitmap.SQLCA | ORSBitmap.REPLY_RLE_COMPRESSED | ORSBitmap.MESSAGE_ID | ORSBitmap.FIRST_LEVEL_TEXT | ORSBitmap.SECOND_LEVEL_TEXT;
     let requestId = RequestID.OPEN_AND_DESCRIBE;
     if (opts.requestResultData) {
-      orsBitmap |= ORSBitmap.DATA_FORMAT | ORSBitmap.RESULT_DATA;
+      orsBitmap |= ORSBitmap.RESULT_DATA;
       requestId = RequestID.OPEN_DESCRIBE_FETCH;
     }
     writeTemplate(template, 0, {
@@ -14524,47 +14527,6 @@ class DBRequestDS {
     });
     return assemblePacket(RequestID.PREPARE_AND_EXECUTE, TEMPLATE_LENGTH, template, cps);
   }
-  static buildChangeDescriptor(opts) {
-    const { rpbId, descriptorHandle, descriptors, recordSize } = opts;
-    const numFields = descriptors.length;
-    const FIELD_SIZE = 54;
-    const formatLen = 8 + numFields * FIELD_SIZE;
-    const formatBuf = Buffer.alloc(formatLen);
-    const fieldLengths = descriptors.map((desc) => desc.rawFieldLength ?? (desc.length || 0));
-    const computedRecordSize = fieldLengths.reduce((sum, len) => sum + len, 0);
-    formatBuf.writeInt32BE(1, 0);
-    formatBuf.writeInt16BE(numFields, 4);
-    formatBuf.writeInt16BE(computedRecordSize, 6);
-    for (let i = 0;i < numFields; i++) {
-      const desc = descriptors[i];
-      const off = 8 + i * FIELD_SIZE;
-      formatBuf.writeInt16BE(FIELD_SIZE, off);
-      formatBuf.writeInt16BE(desc.sqlType | 1, off + 2);
-      formatBuf.writeInt16BE(fieldLengths[i], off + 4);
-      formatBuf.writeInt16BE(desc.scale ?? 0, off + 6);
-      formatBuf.writeInt16BE(desc.precision ?? 0, off + 8);
-      formatBuf.writeUInt16BE(desc.ccsid ?? 0, off + 10);
-      formatBuf[off + 12] = 240;
-    }
-    const cps = [buildRawCP(14337, formatBuf)];
-    const template = Buffer.alloc(TEMPLATE_LENGTH);
-    writeTemplate(template, 0, {
-      orsBitmap: ORSBitmap.SEND_REPLY_IMMED,
-      rpbId,
-      pmDescriptorHandle: descriptorHandle,
-      paramCount: cps.length
-    });
-    return assemblePacket(RequestID.CHANGE_DESCRIPTOR, TEMPLATE_LENGTH, template, cps);
-  }
-  static buildDeleteDescriptor(opts) {
-    const template = Buffer.alloc(TEMPLATE_LENGTH);
-    writeTemplate(template, 0, {
-      orsBitmap: ORSBitmap.SEND_REPLY_IMMED,
-      rpbId: opts.rpbId,
-      pmDescriptorHandle: opts.descriptorHandle
-    });
-    return assemblePacket(RequestID.DELETE_DESCRIPTOR, TEMPLATE_LENGTH, template, []);
-  }
   static buildParameterFormat(descriptors) {
     const numFields = descriptors.length;
     const FIELD_SIZE = 54;
@@ -14587,6 +14549,77 @@ class DBRequestDS {
       formatBuf[off + 12] = 240;
     }
     return formatBuf;
+  }
+  static buildOriginalParameterFormat(descriptors) {
+    const numFields = descriptors.length;
+    const FIELD_SIZE = 54;
+    const buf = Buffer.alloc(8 + numFields * FIELD_SIZE);
+    const fieldLengths = descriptors.map((d) => d.rawFieldLength ?? d.length ?? 0);
+    const recordSize = fieldLengths.reduce((s, l) => s + l, 0);
+    buf.writeInt32BE(1, 0);
+    buf.writeInt16BE(numFields, 4);
+    buf.writeInt16BE(recordSize & 65535, 6);
+    for (let i = 0;i < numFields; i++) {
+      const d = descriptors[i];
+      const off = 8 + i * FIELD_SIZE;
+      const absType = Math.abs(d.sqlType) & 65534;
+      const scale = absType === 484 || absType === 488 ? d.scale ?? 0 : 0;
+      buf.writeInt16BE(FIELD_SIZE, off);
+      buf.writeInt16BE(d.sqlType | 1, off + 2);
+      buf.writeInt16BE(fieldLengths[i] & 65535, off + 4);
+      buf.writeInt16BE(scale, off + 6);
+      buf.writeInt16BE(d.precision ?? 0, off + 8);
+      buf.writeUInt16BE(d.ccsid ?? 0, off + 10);
+    }
+    return buf;
+  }
+  static buildExtendedParameterFormat(descriptors) {
+    const numFields = descriptors.length;
+    const FIELD_SIZE = 64;
+    const buf = Buffer.alloc(16 + numFields * FIELD_SIZE);
+    const fieldLengths = descriptors.map((d) => d.rawFieldLength ?? d.length ?? 0);
+    const recordSize = fieldLengths.reduce((s, l) => s + l, 0);
+    buf.writeInt32BE(1, 0);
+    buf.writeInt32BE(numFields, 4);
+    buf.writeInt32BE(0, 8);
+    buf.writeInt32BE(recordSize, 12);
+    for (let i = 0;i < numFields; i++) {
+      const d = descriptors[i];
+      const off = 16 + i * FIELD_SIZE;
+      const absType = Math.abs(d.sqlType) & 65534;
+      const scale = absType === 484 || absType === 488 ? d.scale ?? 0 : 0;
+      buf.writeInt16BE(FIELD_SIZE, off);
+      buf.writeInt16BE(d.sqlType | 1, off + 2);
+      buf.writeInt32BE(fieldLengths[i], off + 4);
+      buf.writeInt16BE(scale, off + 8);
+      buf.writeInt16BE(d.precision ?? 0, off + 10);
+      buf.writeUInt16BE(d.ccsid ?? 0, off + 12);
+    }
+    return buf;
+  }
+  static buildChangeDescriptor(opts) {
+    const cps = [];
+    if (opts.originalParameterFormat) {
+      cps.push(buildRawCP(14337, opts.originalParameterFormat));
+    } else if (opts.extendedParameterFormat) {
+      cps.push(buildRawCP(14366, opts.extendedParameterFormat));
+    }
+    const template = Buffer.alloc(TEMPLATE_LENGTH);
+    writeTemplate(template, 0, {
+      orsBitmap: ORSBitmap.SEND_REPLY_IMMED,
+      rpbId: opts.rpbId ?? 0,
+      pmDescriptorHandle: opts.descriptorHandle,
+      paramCount: cps.length
+    });
+    return assemblePacket(RequestID.CHANGE_DESCRIPTOR, TEMPLATE_LENGTH, template, cps);
+  }
+  static buildDeleteDescriptor(opts) {
+    const template = Buffer.alloc(TEMPLATE_LENGTH);
+    writeTemplate(template, 0, {
+      orsBitmap: ORSBitmap.SEND_REPLY_IMMED,
+      pmDescriptorHandle: opts.descriptorHandle
+    });
+    return assemblePacket(RequestID.DELETE_DESCRIPTOR, TEMPLATE_LENGTH, template, []);
   }
   static buildCommit(opts = {}) {
     const template = Buffer.alloc(TEMPLATE_LENGTH);
@@ -14680,9 +14713,11 @@ var REPLY_CP = {
   SQLCA: 14343,
   PARAMETER_MARKER_FORMAT: 14344,
   PACKAGE_RETURN_INFO: 14347,
+  EXT_PARAMETER_MARKER_FORMAT: 14349,
   RESULT_DATA: 14350,
   EXT_COLUMN_DESCRIPTORS: 14353,
   SUPER_EXT_DATA_FORMAT: 14354,
+  SUPER_EXT_PARAMETER_MARKER_FORMAT: 14355,
   RLE_COMPRESSED: 14386,
   DATASTREAM_LEVEL: 14849
 };
@@ -14944,7 +14979,7 @@ function parseOperationReply(buf, opts = {}) {
   } else {
     sqlca = createEmptySQLCA();
   }
-  if (tmpl.rcClass === 1 && tmpl.rcReturnCode < 0) {
+  if (tmpl.rcClass !== 0 && tmpl.rcClass !== 2 && tmpl.rcReturnCode < 0) {
     const msgs = extractErrorMessages(reply.codePoints, serverCCSID);
     if (sqlca.isSuccess && !sqlca.isError) {
       sqlca = {
@@ -15559,10 +15594,14 @@ function parseSuperExtendedDataFormat(buf) {
         }
       }
     }
+    const absType = Math.abs(fp.sqlType) & 65534;
+    const isVarLen = absType === 448 || absType === 464 || absType === 456 || absType === 472 || absType === 908;
+    const normalizedLength = isVarLen && fp.length >= 2 ? fp.length - 2 : fp.length;
     descriptors.push({
       index: i,
       sqlType: fp.sqlType,
-      length: fp.length,
+      length: normalizedLength,
+      rawFieldLength: fp.length,
       scale: fp.scale,
       precision: fp.precision,
       ccsid: fp.ccsid,
@@ -16851,6 +16890,10 @@ function inferStatementType(sql) {
     text = text.slice(retStripped[0].length);
   if (text.startsWith("SELECT"))
     return StatementType.SELECT;
+  if (text.startsWith("WITH"))
+    return StatementType.SELECT;
+  if (text.startsWith("VALUES"))
+    return StatementType.SELECT;
   if (text.startsWith("CALL"))
     return StatementType.CALL;
   if (text.startsWith("COMMIT"))
@@ -17029,6 +17072,7 @@ class StatementManager {
       identifierCcsid: this.#serverCCSID,
       libraryName: rpbLibraryName,
       openAttributes,
+      describeOption: 213,
       holdIndicator: this.defaultHoldIndicator ?? undefined
     });
     const createReplyBuf = await this.#connection.sendAndReceive(createRpbBuf);
@@ -17064,10 +17108,9 @@ class StatementManager {
         sqlText: sql,
         statementName,
         identifierCcsid: this.#serverCCSID,
+        statementTextCcsid: 13488,
         statementType,
         prepareOption,
-        openAttributes,
-        extendedColumnDescriptorOption: 241,
         parameterMarkerFormat: true,
         packageName
       });
@@ -17086,11 +17129,23 @@ class StatementManager {
         }
       }
       const basicParamData = getCodePointData(prepReply, 14344);
+      const extParamData = getCodePointData(prepReply, 14349);
+      const superParamData = getCodePointData(prepReply, 14355);
       if (basicParamData && basicParamData.length >= 8) {
         const parsed = parseBasicDataFormat(basicParamData);
         paramDescriptors = parsed.descriptors;
         paramRecordSize = parsed.recordSize;
         rawParamFormat = Buffer.from(basicParamData);
+      } else if (extParamData && extParamData.length >= 8) {
+        const parsed = parseBasicDataFormat(extParamData);
+        paramDescriptors = parsed.descriptors;
+        paramRecordSize = parsed.recordSize;
+        rawParamFormat = Buffer.from(extParamData);
+      } else if (superParamData && superParamData.length >= 16) {
+        const parsed = parseSuperExtendedDataFormat(superParamData);
+        paramDescriptors = parsed.descriptors;
+        paramRecordSize = parsed.recordSize;
+        rawParamFormat = DBRequestDS.buildExtendedParameterFormat(paramDescriptors);
       }
     } else {
       statementNameOverride = cachedEntry.statementName || null;
@@ -17100,6 +17155,7 @@ class StatementManager {
       rawParamFormat = null;
       pkg.recordHit();
     }
+    let descriptorHandle = rpbId;
     const stmt = {
       rpbId,
       sql,
@@ -17113,7 +17169,7 @@ class StatementManager {
       rawParamFormat,
       paramCount: paramDescriptors.length,
       columnCount: columnDescriptors.length,
-      descriptorHandle: 0,
+      descriptorHandle,
       lastSentWidths: null,
       closed: false,
       packageName: packageName ?? null
@@ -17128,31 +17184,30 @@ class StatementManager {
     let parameterMarkerData = null;
     let activeParamDescriptors = stmt.paramDescriptors;
     if (params.length > 0 && stmt.paramDescriptors.length > 0) {
-      const parameterPlan = this.#planParameterDescriptors(params, stmt.paramDescriptors);
-      activeParamDescriptors = parameterPlan.descriptors;
-      parameterMarkerData = this.#encodeParameters(params, activeParamDescriptors, parameterPlan.encodedValues);
       if (stmt.descriptorHandle === 0) {
         stmt.descriptorHandle = stmt.rpbId;
       }
+      const extParamFmt = DBRequestDS.buildExtendedParameterFormat(stmt.paramDescriptors);
       const cdBuf = DBRequestDS.buildChangeDescriptor({
         rpbId: stmt.rpbId,
         descriptorHandle: stmt.descriptorHandle,
-        descriptors: activeParamDescriptors,
-        recordSize: stmt.paramRecordSize
+        extendedParameterFormat: extParamFmt
       });
       const cdReplyBuf = await this.#connection.sendAndReceive(cdBuf);
       const cdReply = parseOperationReply(cdReplyBuf, { serverCCSID: this.#serverCCSID });
       throwIfError2(cdReply.sqlca, "Change descriptor");
+      parameterMarkerData = this.#encodeParameters(params, stmt.paramDescriptors);
     }
-    const isSelect = stmt.columnDescriptors.length > 0;
+    const isSelect = stmt.columnDescriptors.length > 0 || inferStatementType(stmt.sql) === StatementType.SELECT;
     if (isSelect) {
       const isReadOnlyCursor = (stmt.openAttributes ?? OpenAttributes.READ_ONLY) === OpenAttributes.READ_ONLY;
       const blockingFactor = isReadOnlyCursor ? opts.blockingFactor ?? this.#computeBlockSizeRows(stmt.columnDescriptors, stmt.openAttributes) ?? 2048 : 1;
       const requestResultData = false;
+      const pmDescHandle = stmt.descriptorHandle;
       const reqBuf2 = DBRequestDS.buildOpenAndDescribe({
         rpbId: stmt.rpbId,
         parameterMarkerData,
-        pmDescriptorHandle: stmt.descriptorHandle ?? 0,
+        pmDescriptorHandle: pmDescHandle,
         identifierCcsid: this.#serverCCSID,
         openAttributes: stmt.openAttributes ?? OpenAttributes.READ_ONLY,
         blockingFactor,
@@ -17205,7 +17260,7 @@ class StatementManager {
     const reqBuf = DBRequestDS.buildExecute({
       rpbId: stmt.rpbId,
       parameterMarkerData,
-      pmDescriptorHandle: stmt.descriptorHandle ?? 0,
+      pmDescriptorHandle: stmt.descriptorHandle > 0 ? stmt.descriptorHandle : 0,
       requestOutputData,
       identifierCcsid: this.#serverCCSID,
       statementName: stmt.statementNameOverride ?? undefined,
@@ -17367,22 +17422,20 @@ class StatementManager {
     }
     const widthsSig = batchDescriptors.map((d) => d.length).join(",");
     if (stmt.lastSentWidths !== widthsSig) {
+      const extParamFmt = DBRequestDS.buildExtendedParameterFormat(batchDescriptors);
       const cdBuf = DBRequestDS.buildChangeDescriptor({
         rpbId: stmt.rpbId,
         descriptorHandle: stmt.descriptorHandle,
-        descriptors: batchDescriptors,
-        recordSize: paramRecordSize
+        extendedParameterFormat: extParamFmt
       });
-      const cdReplyBuf = await this.#connection.sendAndReceive(cdBuf);
-      const cdReply = parseOperationReply(cdReplyBuf, { serverCCSID: this.#serverCCSID });
-      throwIfError2(cdReply.sqlca, "Change descriptor (batch)");
+      await this.#connection.send(cdBuf);
       stmt.lastSentWidths = widthsSig;
     }
     const isInsert = inferStatementType(stmt.sql) === StatementType.OTHER && /^\s*(?:--[^\n]*\n|\/\*[\s\S]*?\*\/|\s)*INSERT\b/i.test(stmt.sql);
     const MAX_CHUNK = 32000;
     let totalAffected = 0;
     let lastSqlca = null;
-    const DBOD_HEADER_SIZE = 14;
+    const DBOD_HEADER_SIZE = 20;
     const INDICATOR_SIZE = 2;
     const prof = StatementManager._batchProfile;
     for (let chunkStart = 0;chunkStart < batchSize; chunkStart += MAX_CHUNK) {
@@ -17394,7 +17447,7 @@ class StatementManager {
       const tEnc0 = prof ? performance.now() : 0;
       const { buffer: reqBuf, paramDataOffset } = DBRequestDS.buildExecuteInPlace({
         rpbId: stmt.rpbId,
-        pmDescriptorHandle: stmt.descriptorHandle,
+        pmDescriptorHandle: stmt.descriptorHandle > 0 ? stmt.descriptorHandle : 0,
         parameterMarkerDataSize: paramDataSize,
         rleRequestCompression: true,
         rleReplyCompression: true
@@ -17445,6 +17498,7 @@ class StatementManager {
       rpbId,
       sqlText: sql,
       identifierCcsid: this.#serverCCSID,
+      statementTextCcsid: 13488,
       packageName,
       prepareOption,
       statementType
@@ -17523,7 +17577,8 @@ class StatementManager {
     buf.writeInt32BE(rowCount, baseOffset + 4);
     buf.writeInt16BE(columnCount, baseOffset + 8);
     buf.writeInt16BE(indicatorSize, baseOffset + 10);
-    buf.writeInt16BE(rowSize, baseOffset + 12);
+    buf.writeInt32BE(0, baseOffset + 12);
+    buf.writeInt32BE(rowSize, baseOffset + 16);
     const colOffsets = new Array(columnCount);
     const colEncoders = new Array(columnCount);
     let off = 0;
@@ -17706,7 +17761,7 @@ class StatementManager {
     for (const desc of descriptors) {
       rowSize += getColumnByteLength(desc);
     }
-    const headerSize = 14;
+    const headerSize = 20;
     const indicatorBlockSize = rowCount * columnCount * indicatorSize;
     const dataBlockSize = rowCount * rowSize;
     const totalSize = headerSize + indicatorBlockSize + dataBlockSize;
@@ -17715,7 +17770,8 @@ class StatementManager {
     buf.writeInt32BE(rowCount, 4);
     buf.writeInt16BE(columnCount, 8);
     buf.writeInt16BE(indicatorSize, 10);
-    buf.writeInt16BE(rowSize, 12);
+    buf.writeInt32BE(0, 12);
+    buf.writeInt32BE(rowSize, 16);
     const indicatorStart = headerSize;
     for (let i = 0;i < columnCount; i++) {
       const isNull = i >= params.length || params[i] === null || params[i] === undefined;
@@ -18676,8 +18732,10 @@ class DbConnection {
   #cancelChannel;
   #cancelChannelPromise;
   #cancelMetrics;
+  #ownsSystem;
   constructor(system, opts = {}, rawOpts = opts) {
     this.#system = system;
+    this.#ownsSystem = opts._ownsSystem ?? false;
     this.#properties = { ...defaultProperties, ...opts };
     this.#userOpts = rawOpts || {};
     this.#connected = false;
@@ -18997,6 +19055,18 @@ class DbConnection {
       } catch {}
     }
     this.#cancelChannel = null;
+    if (this.#connection && typeof this.#connection.close === "function") {
+      try {
+        this.#connection.close();
+      } catch {}
+    }
+    this.#connection = null;
+    if (this.#ownsSystem && this.#system) {
+      try {
+        await this.#system.close();
+      } catch {}
+    }
+    this.#system = null;
     this.#connected = false;
     Trace.log(Trace.JDBC, "Database connection closed");
   }
@@ -24216,6 +24286,7 @@ async function connect(systemOrUrl, opts = {}) {
     });
     await system.signon();
     const normalized = normalizeProperties(connOpts);
+    normalized._ownsSystem = true;
     const db = new DbConnection(system, normalized, connOpts);
     await db.connect();
     return new Connection2(db);

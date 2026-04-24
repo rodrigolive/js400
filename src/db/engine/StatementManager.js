@@ -58,6 +58,10 @@ function inferStatementType(sql) {
   if (retStripped) text = text.slice(retStripped[0].length);
 
   if (text.startsWith('SELECT')) return StatementType.SELECT;
+  // CTEs: `WITH ... AS (...) SELECT ...` and `VALUES (...)` produce
+  // result sets and must use OPEN_AND_DESCRIBE, not EXECUTE.
+  if (text.startsWith('WITH')) return StatementType.SELECT;
+  if (text.startsWith('VALUES')) return StatementType.SELECT;
   if (text.startsWith('CALL')) return StatementType.CALL;
   if (text.startsWith('COMMIT')) return StatementType.COMMIT;
   if (text.startsWith('ROLLBACK')) return StatementType.ROLLBACK;
@@ -337,6 +341,7 @@ export class StatementManager {
       identifierCcsid: this.#serverCCSID,
       libraryName: rpbLibraryName,
       openAttributes,
+      describeOption: 0xD5,
       holdIndicator: this.defaultHoldIndicator ?? undefined,
     });
     const createReplyBuf = await this.#connection.sendAndReceive(createRpbBuf);
@@ -379,19 +384,21 @@ export class StatementManager {
     let statementNameOverride = null;
 
     if (!cachedEntry) {
-      // Prepare and describe with all required attributes (per jtopenlite)
+      // Prepare and describe — match JTOpen JDBC: describe option goes
+      // on the CREATE_RPB, NOT on the PREPARE request.
       const prepBuf = DBRequestDS.buildPrepareAndDescribe({
         rpbId,
         sqlText: sql,
         statementName,
         identifierCcsid: this.#serverCCSID,
+        statementTextCcsid: 13488,
         statementType,
         prepareOption,
-        openAttributes,
         parameterMarkerFormat: true,
         packageName,
       });
       const prepReplyBuf = await this.#connection.sendAndReceive(prepBuf);
+
       const prepReply = parseOperationReply(prepReplyBuf, { serverCCSID: this.#serverCCSID });
       throwIfError(prepReply.sqlca, 'Prepare');
 
@@ -408,11 +415,26 @@ export class StatementManager {
       }
 
       const basicParamData = getCodePointData(prepReply, 0x3808);
+      const extParamData = getCodePointData(prepReply, 0x380D);
+      const superParamData = getCodePointData(prepReply, 0x3813);
       if (basicParamData && basicParamData.length >= 8) {
         const parsed = parseBasicDataFormat(basicParamData);
         paramDescriptors = parsed.descriptors;
         paramRecordSize = parsed.recordSize;
         rawParamFormat = Buffer.from(basicParamData);
+      } else if (extParamData && extParamData.length >= 8) {
+        const parsed = parseBasicDataFormat(extParamData);
+        paramDescriptors = parsed.descriptors;
+        paramRecordSize = parsed.recordSize;
+        rawParamFormat = Buffer.from(extParamData);
+      } else if (superParamData && superParamData.length >= 16) {
+        const parsed = parseSuperExtendedDataFormat(superParamData);
+        paramDescriptors = parsed.descriptors;
+        paramRecordSize = parsed.recordSize;
+        // parseSuperExtendedDataFormat now normalizes variable-length
+        // field lengths (subtracts 2-byte LL prefix) and preserves the
+        // wire length in rawFieldLength, matching parseBasicDataFormat.
+        rawParamFormat = DBRequestDS.buildExtendedParameterFormat(paramDescriptors);
       }
     } else {
       statementNameOverride = cachedEntry.statementName || null;
@@ -422,6 +444,10 @@ export class StatementManager {
       rawParamFormat = null; // Reconstructed from descriptors on first execute
       pkg.recordHit();
     }
+
+    // JTOpen: descriptorHandle_ = id_ (= rpbId). The server creates
+    // descriptor slots tied to RPB handles, not a separate counter.
+    let descriptorHandle = rpbId;
 
     const stmt = {
       rpbId,
@@ -436,7 +462,7 @@ export class StatementManager {
       rawParamFormat,
       paramCount: paramDescriptors.length,
       columnCount: columnDescriptors.length,
-      descriptorHandle: 0,  // set at first execute via changeDescriptor
+      descriptorHandle,
       // Widths last sent to the server via changeDescriptor. Used by
       // executeBatch to avoid a redundant changeDescriptor RTT when
       // successive batches have the same field widths.
@@ -469,25 +495,22 @@ export class StatementManager {
     let parameterMarkerData = null;
     let activeParamDescriptors = stmt.paramDescriptors;
     if (params.length > 0 && stmt.paramDescriptors.length > 0) {
-      const parameterPlan = this.#planParameterDescriptors(params, stmt.paramDescriptors);
-      activeParamDescriptors = parameterPlan.descriptors;
-      parameterMarkerData = this.#encodeParameters(params, activeParamDescriptors, parameterPlan.encodedValues);
-
-      // Per JTOpen, parameter descriptors must match the actual bound widths.
-      // Re-send the descriptor when parameters are present so LONGVARCHAR and
-      // similar host-described max widths are shrunk to the value being sent.
+      // Register parameter format via CHANGE_DESCRIPTOR.
       if (stmt.descriptorHandle === 0) {
         stmt.descriptorHandle = stmt.rpbId;
       }
+      const extParamFmt = DBRequestDS.buildExtendedParameterFormat(stmt.paramDescriptors);
       const cdBuf = DBRequestDS.buildChangeDescriptor({
         rpbId: stmt.rpbId,
         descriptorHandle: stmt.descriptorHandle,
-        descriptors: activeParamDescriptors,
-        recordSize: stmt.paramRecordSize,
+        extendedParameterFormat: extParamFmt,
       });
       const cdReplyBuf = await this.#connection.sendAndReceive(cdBuf);
       const cdReply = parseOperationReply(cdReplyBuf, { serverCCSID: this.#serverCCSID });
       throwIfError(cdReply.sqlca, 'Change descriptor');
+
+      // Encode parameter data using the PREPARE-time descriptors.
+      parameterMarkerData = this.#encodeParameters(params, stmt.paramDescriptors);
     }
 
     // JTOpen uses separate function IDs for SELECT vs DML:
@@ -528,18 +551,15 @@ export class StatementManager {
           )
         : 1;
       const requestResultData = false;
+      const pmDescHandle = stmt.descriptorHandle;
       const reqBuf = DBRequestDS.buildOpenAndDescribe({
         rpbId: stmt.rpbId,
         parameterMarkerData,
-        parameterMarkerFormat: stmt.rawParamFormat ?? undefined,
-        pmDescriptorHandle: stmt.descriptorHandle ?? 0,
+        pmDescriptorHandle: pmDescHandle,
         identifierCcsid: this.#serverCCSID,
         openAttributes: stmt.openAttributes ?? OpenAttributes.READ_ONLY,
         blockingFactor,
         requestResultData,
-        // JTOpen nameOverride_ is only sent when the package cache
-        // resolved the statement by name; normal packaged prepares
-        // do not echo the statement name back here.
         statementName: stmt.statementNameOverride ?? undefined,
         packageName: stmt.packageName ?? undefined,
       });
@@ -619,11 +639,9 @@ export class StatementManager {
     const reqBuf = DBRequestDS.buildExecute({
       rpbId: stmt.rpbId,
       parameterMarkerData,
-      pmDescriptorHandle: stmt.descriptorHandle ?? 0,
+      pmDescriptorHandle: stmt.descriptorHandle > 0 ? stmt.descriptorHandle : 0,
       requestOutputData,
       identifierCcsid: this.#serverCCSID,
-      // JTOpen nameOverride_ — only the cache-hit path sends the
-      // prepared statement name on EXECUTE.
       statementName: stmt.statementNameOverride ?? undefined,
       packageName: stmt.packageName ?? undefined,
     });
@@ -836,22 +854,23 @@ export class StatementManager {
       paramRecordSize += getColumnByteLength(batchDescriptors[c]);
     }
 
-    // Send the change-descriptor only when widths actually change.
-    // On subsequent batches with the same schema we can skip this RTT.
+    // Register the parameter format via CHANGE_DESCRIPTOR for batched
+    // execution. Unlike single-row execute (which sends the format
+    // inline), batch uses buildExecuteInPlace which doesn't carry
+    // inline format — so we must pre-register via CHANGE_DESCRIPTOR.
     if (stmt.descriptorHandle === 0) {
       stmt.descriptorHandle = stmt.rpbId;
     }
     const widthsSig = batchDescriptors.map(d => d.length).join(',');
     if (stmt.lastSentWidths !== widthsSig) {
+      const extParamFmt = DBRequestDS.buildExtendedParameterFormat(batchDescriptors);
       const cdBuf = DBRequestDS.buildChangeDescriptor({
         rpbId: stmt.rpbId,
         descriptorHandle: stmt.descriptorHandle,
-        descriptors: batchDescriptors,
-        recordSize: paramRecordSize,
+        extendedParameterFormat: extParamFmt,
       });
-      const cdReplyBuf = await this.#connection.sendAndReceive(cdBuf);
-      const cdReply = parseOperationReply(cdReplyBuf, { serverCCSID: this.#serverCCSID });
-      throwIfError(cdReply.sqlca, 'Change descriptor (batch)');
+      // Fire-and-forget (JTOpen JDBC: ORS bitmap=0, no reply).
+      await this.#connection.send(cdBuf);
       stmt.lastSentWidths = widthsSig;
     }
 
@@ -864,8 +883,8 @@ export class StatementManager {
     let totalAffected = 0;
     let lastSqlca = null;
 
-    // DBOriginalData layout constants (see #encodeParametersBatchInto).
-    const DBOD_HEADER_SIZE = 14;
+    // DBExtendedData layout constants (see #encodeParametersBatchInto).
+    const DBOD_HEADER_SIZE = 20;
     const INDICATOR_SIZE = 2;
 
     const prof = StatementManager._batchProfile;
@@ -884,7 +903,7 @@ export class StatementManager {
       // buffer, no double memcopy.
       const { buffer: reqBuf, paramDataOffset } = DBRequestDS.buildExecuteInPlace({
         rpbId: stmt.rpbId,
-        pmDescriptorHandle: stmt.descriptorHandle,
+        pmDescriptorHandle: stmt.descriptorHandle > 0 ? stmt.descriptorHandle : 0,
         parameterMarkerDataSize: paramDataSize,
         rleRequestCompression: true,
         rleReplyCompression: true,
@@ -962,6 +981,7 @@ export class StatementManager {
       rpbId,
       sqlText: sql,
       identifierCcsid: this.#serverCCSID,
+      statementTextCcsid: 13488,
       packageName,
       prepareOption,
       statementType,
@@ -1039,13 +1059,14 @@ export class StatementManager {
   /**
    * Encode parameter values into a DBOriginalData buffer for 0x3811.
    *
-   * Per JTOpen DBOriginalData.java, the format is:
-   *   Header (14 bytes):
+   * Per JTOpen DBExtendedData.java, the format is:
+   *   Header (20 bytes):
    *     +0:  int32 consistencyToken (= 1)
    *     +4:  int32 rowCount
    *     +8:  int16 columnCount
    *     +10: int16 indicatorSize (= 2)
-   *     +12: int16 rowSize (data bytes per row, NO indicators)
+   *     +12: int32 reserved (= 0)
+   *     +16: int32 rowSize (data bytes per row, NO indicators)
    *   Indicators section: rowCount × columnCount × indicatorSize bytes
    *     Each indicator is int16: 0=not-null, -1=null
    *   Data section: rowCount × rowSize bytes
@@ -1087,12 +1108,13 @@ export class StatementManager {
    * (code point 0x3811). Mirrors the DBOriginalData header layout
    * from JTOpen:
    *
-   *   Header (14 bytes):
+   *   Header (20 bytes, DBExtendedData):
    *     +0:  int32 consistencyToken (= 1)
    *     +4:  int32 rowCount
    *     +8:  int16 columnCount
    *     +10: int16 indicatorSize (= 2)
-   *     +12: int16 rowSize          (data bytes per row, no indicators)
+   *     +12: int32 reserved (= 0)
+   *     +16: int32 rowSize          (data bytes per row, no indicators)
    *   Indicators: rowCount * columnCount * 2 bytes, row-major
    *     0 = value present, -1 (0xFFFF) = SQL NULL
    *   Data: rowCount * rowSize bytes
@@ -1133,12 +1155,13 @@ export class StatementManager {
     const headerSize = 14;
     const indicatorBlockSize = rowCount * columnCount * indicatorSize;
 
-    // DBOriginalData header (14 bytes) at baseOffset
+    // DBExtendedData header (20 bytes) at baseOffset
     buf.writeInt32BE(1, baseOffset);                     // consistencyToken
     buf.writeInt32BE(rowCount, baseOffset + 4);          // rowCount
     buf.writeInt16BE(columnCount, baseOffset + 8);       // columnCount
     buf.writeInt16BE(indicatorSize, baseOffset + 10);    // indicatorSize
-    buf.writeInt16BE(rowSize, baseOffset + 12);          // rowSize (data only)
+    buf.writeInt32BE(0, baseOffset + 12);                // reserved
+    buf.writeInt32BE(rowSize, baseOffset + 16);          // rowSize (int32)
 
     // Pre-resolve per-column state once per chunk:
     //   - field offset / length within a row
@@ -1379,19 +1402,23 @@ export class StatementManager {
       rowSize += getColumnByteLength(desc);
     }
 
-    const headerSize = 14;
+    // DBExtendedData header (20 bytes) — matches JTOpen DBExtendedData.java.
+    // Original format (DBOriginalData) uses 14 bytes with int16 rowSize;
+    // extended format uses 20 bytes with int32 rowSize + 4 reserved bytes.
+    const headerSize = 20;
     const indicatorBlockSize = rowCount * columnCount * indicatorSize;
     const dataBlockSize = rowCount * rowSize;
     const totalSize = headerSize + indicatorBlockSize + dataBlockSize;
 
     const buf = Buffer.alloc(totalSize);
 
-    // Header
+    // Header (DBExtendedData layout)
     buf.writeInt32BE(1, 0);                     // consistencyToken
     buf.writeInt32BE(rowCount, 4);              // rowCount
     buf.writeInt16BE(columnCount, 8);           // columnCount
     buf.writeInt16BE(indicatorSize, 10);        // indicatorSize
-    buf.writeInt16BE(rowSize, 12);              // rowSize (data only)
+    buf.writeInt32BE(0, 12);                    // reserved
+    buf.writeInt32BE(rowSize, 16);              // rowSize (int32)
 
     // Indicators section
     const indicatorStart = headerSize;

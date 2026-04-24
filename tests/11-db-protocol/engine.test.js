@@ -254,7 +254,7 @@ describe('StatementManager', () => {
     expect(readShortCodePoint(requests[1], CodePoint.STATEMENT_TYPE)).toBe(StatementType.OTHER);
   });
 
-  test('execute() shrinks LONGVARCHAR parameter descriptors to the bound value length', async () => {
+  test('execute() sends LONGVARCHAR parameter descriptors via extended format', async () => {
     const requests = [];
     const mockConn = {
       async sendAndReceive(buf) {
@@ -287,10 +287,12 @@ describe('StatementManager', () => {
     await expect(sm.execute(stmt, ['MYLIB'])).resolves.toBeDefined();
 
     expect(requests.length).toBeGreaterThanOrEqual(4);
-    const formatBuf = readRawCodePoint(requests[2], 0x3801);
+    // CHANGE_DESCRIPTOR sends extended format (0x381E) with PREPARE-time widths
+    const formatBuf = readRawCodePoint(requests[2], 0x381E);
     expect(formatBuf).not.toBeNull();
-    expect(formatBuf.readInt16BE(6)).toBe(16);   // recordSize
-    expect(formatBuf.readInt16BE(12)).toBe(16);  // fieldLength
+    // Extended format: recordSize at offset 12 (int32), fieldLength at field[0]+4 (int32)
+    expect(formatBuf.readInt32BE(12)).toBe(32742);     // full PREPARE-time width
+    expect(formatBuf.readInt32BE(16 + 4)).toBe(32742); // rawFieldLength
   });
 });
 

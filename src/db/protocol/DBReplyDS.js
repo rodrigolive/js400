@@ -43,9 +43,11 @@ const REPLY_CP = {
   SQLCA:                    0x3807,
   PARAMETER_MARKER_FORMAT:  0x3808,
   PACKAGE_RETURN_INFO:      0x380B,  // Package info from RETURN_PACKAGE (JTOpen DBBaseReplyDS case 0x380B)
+  EXT_PARAMETER_MARKER_FORMAT: 0x380D,
   RESULT_DATA:              0x380E,
   EXT_COLUMN_DESCRIPTORS:   0x3811,
   SUPER_EXT_DATA_FORMAT:    0x3812,
+  SUPER_EXT_PARAMETER_MARKER_FORMAT: 0x3813,
   RLE_COMPRESSED:           0x3832,
   DATASTREAM_LEVEL:         0x3A01,
 };
@@ -460,9 +462,12 @@ export function parseOperationReply(buf, opts = {}) {
     sqlca = createEmptySQLCA();
   }
 
-  // Check reply template for errors (rcClass == 1 means error;
-  // rcClass == 2 means "data returned" which is success).
-  if (tmpl.rcClass === 1 && tmpl.rcReturnCode < 0) {
+  // Check reply template for errors.
+  // rcClass 0 = success, 2 = data returned (success).
+  // rcClass 1 = error with details, 7 = server/resource error,
+  // 8 = exit program error. All non-zero classes with negative
+  // return codes are errors (per jtopenlite DatabaseException).
+  if (tmpl.rcClass !== 0 && tmpl.rcClass !== 2 && tmpl.rcReturnCode < 0) {
     // Server reported an error via the reply template
     const msgs = extractErrorMessages(reply.codePoints, serverCCSID);
     // If we have an SQLCA, it already captures the error.

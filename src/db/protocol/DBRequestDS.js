@@ -92,6 +92,7 @@ export const CodePoint = Object.freeze({
   HOLD_INDICATOR:              0x380F,
   REUSE_INDICATOR:             0x3810,
   PARAMETER_MARKER_DATA:       0x3811,
+  EXTENDED_PARAMETER_MARKER_DATA: 0x381F,
   STATEMENT_TYPE:              0x3812,
   PARAMETER_MARKER_BLOCK_IND:  0x3814,
   RETURN_SIZE:                 0x3815,
@@ -255,13 +256,15 @@ function buildTextCP(cp, text, ccsid = UNICODE_CCSID) {
  * @param {string} text
  * @returns {Buffer}
  */
-function buildExtTextCP(cp, text) {
-  const textBuf = encodeUtf16BE(text);
+function buildExtTextCP(cp, text, ccsid = UNICODE_CCSID) {
+  const textBuf = ccsid === UNICODE_CCSID
+    ? encodeUtf16BE(text)
+    : CharConverter.stringToByteArray(text, ccsid);
   const ll = 12 + textBuf.length;
   const buf = Buffer.alloc(ll);
   buf.writeInt32BE(ll, 0);
   buf.writeUInt16BE(cp, 4);
-  buf.writeUInt16BE(UNICODE_CCSID, 6);
+  buf.writeUInt16BE(ccsid, 6);
   buf.writeInt32BE(textBuf.length, 8);
   textBuf.copy(buf, 12);
   return buf;
@@ -413,13 +416,17 @@ export class DBRequestDS {
     const ccsid = opts.ccsid ?? UNICODE_CCSID;
     const dsLevel = opts.datastreamLevel ?? 5;
 
-    // Code points for attributes to set (per jtopenlite JDBCConnection.setServerAttributes)
+    // Code points for attributes to set (per JTOpen AS400JDBCConnectionImpl.setServerAttributes)
     const cps = [
       buildShortCP(0x3801, ccsid),                          // Default Client CCSID
       buildShortCP(CodePoint.BLOCKING_FACTOR, opts.namingConvention ?? 0), // Naming Convention (0=SQL, 1=System)
       buildByteCP(CodePoint.TRANSLATE_INDICATOR, opts.translateIndicator ?? 1), // Translate Indicator
       buildShortCP(CodePoint.SQL_STATEMENT_TEXT, opts.dateFormat ?? 5), // Date Format (5=ISO)
       buildIntCP(CodePoint.CLIENT_DATASTREAM_LEVEL, dsLevel), // Client Datastream Level
+      // Use super-extended data formats (0xF2) so the server can describe
+      // wide result sets (SELECT *) without overflowing the basic format.
+      // JTOpen sets this for VRM >= V5R4; 0xF1=extended, 0xF2=super-extended.
+      buildByteCP(0x3821, opts.extendedFormats ?? 0xF2),    // Use Extended Formats Indicator
     ];
 
     const template = Buffer.alloc(TEMPLATE_LENGTH);
@@ -631,7 +638,11 @@ export class DBRequestDS {
         opts.identifierCcsid ?? UNICODE_CCSID,
       ));
     }
-    cps.push(buildExtTextCP(CodePoint.EXTENDED_SQL_STATEMENT_TEXT, opts.sqlText));
+    cps.push(buildExtTextCP(
+      CodePoint.EXTENDED_SQL_STATEMENT_TEXT,
+      opts.sqlText,
+      opts.statementTextCcsid ?? UNICODE_CCSID,
+    ));
     if (opts.prepareOption != null) cps.push(buildByteCP(CodePoint.PREPARE_OPTION, opts.prepareOption));
     if (opts.translateIndicator != null) cps.push(buildByteCP(CodePoint.TRANSLATE_INDICATOR, opts.translateIndicator));
 
@@ -672,7 +683,11 @@ export class DBRequestDS {
         identifierCcsid,
       ));
     }
-    cps.push(buildExtTextCP(CodePoint.EXTENDED_SQL_STATEMENT_TEXT, opts.sqlText));
+    cps.push(buildExtTextCP(
+      CodePoint.EXTENDED_SQL_STATEMENT_TEXT,
+      opts.sqlText,
+      opts.statementTextCcsid ?? UNICODE_CCSID,
+    ));
     if (opts.statementType != null) cps.push(buildShortCP(CodePoint.STATEMENT_TYPE, opts.statementType));
     if (opts.prepareOption != null) cps.push(buildByteCP(CodePoint.PREPARE_OPTION, opts.prepareOption));
     if (opts.openAttributes != null) cps.push(buildByteCP(CodePoint.OPEN_ATTRIBUTES, opts.openAttributes));
@@ -692,11 +707,12 @@ export class DBRequestDS {
     }
     if (opts.translateIndicator != null) cps.push(buildByteCP(CodePoint.TRANSLATE_INDICATOR, opts.translateIndicator));
 
-    // JTOpen's PREPARE_DESCRIBE ORS defaults to RETURN_DATA + DATA_FORMAT
-    // + SQLCA + PARAMETER_MARKER_FORMAT. Extended column descriptors are
-    // only requested when explicitly enabled.
+    // jtopenlite always requests EXTENDED_COLUMN_DESCRIPTORS for non-CALL
+    // statements — without it the server may crash (rcClass=7/-101) when
+    // describing wide result sets like SELECT *.
+    const isCall = opts.statementType === 3; // StatementType.CALL
     let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT | ORSBitmap.SQLCA;
-    if (opts.extendedColumnDescriptorOption != null) orsBitmap |= ORSBitmap.EXTENDED_COLUMN_DESCRIPTORS;
+    if (!isCall) orsBitmap |= ORSBitmap.EXTENDED_COLUMN_DESCRIPTORS;
     if (opts.parameterMarkerFormat === true) orsBitmap |= ORSBitmap.PARAMETER_MARKER_FORMAT;
 
     const template = Buffer.alloc(TEMPLATE_LENGTH);
@@ -729,7 +745,7 @@ export class DBRequestDS {
    *   +20 : template (20 bytes)      ORS bitmap | SQLCA, handles,
    *                                  paramCount=2, pmDescriptorHandle
    *   +40 : BLOCK_IND CP (8 bytes)   LL=8, CP=0x3814, statementType(int16)
-   *   +48 : PM_DATA CP header (6)    LL=6+paramDataSize, CP=0x3811
+   *   +48 : PM_DATA CP header (6)    LL=6+paramDataSize, CP=0x381F (ext) or 0x3811
    *   +54 : <caller writes DBOriginalData content here, paramDataSize bytes>
    *
    * @param {object} opts
@@ -791,8 +807,12 @@ export class DBRequestDS {
     cpOff += blockIndCpLen;
 
     // ---- PARAMETER_MARKER_DATA CP header (6 bytes) ----
+    // Use 0x381F (extended) when CHANGE_DESCRIPTOR registered extended format.
     buf.writeInt32BE(pmCpLen, cpOff);
-    buf.writeUInt16BE(CodePoint.PARAMETER_MARKER_DATA, cpOff + 4);
+    const pmCp = (opts.pmDescriptorHandle ?? 0) !== 0
+      ? CodePoint.EXTENDED_PARAMETER_MARKER_DATA
+      : CodePoint.PARAMETER_MARKER_DATA;
+    buf.writeUInt16BE(pmCp, cpOff + 4);
     const paramDataOffset = cpOff + pmCpHeaderLen;
 
     return { buffer: buf, paramDataOffset };
@@ -902,12 +922,15 @@ export class DBRequestDS {
     // Packaged execution repeats PACKAGE_NAME. The library is already
     // bound on CREATE_RPB.
     if (opts.packageName) cps.push(buildTextCP(CodePoint.PACKAGE_NAME, opts.packageName, identifierCcsid));
-    // Per JTOpen: send PARAMETER_MARKER_BLOCK_IND before parameter data
+    // Per JTOpen: send PARAMETER_MARKER_BLOCK_IND before parameter data.
+    // Use 0x381F (extended) when CHANGE_DESCRIPTOR registered extended format.
     if (opts.parameterMarkerData) {
       cps.push(buildShortCP(CodePoint.PARAMETER_MARKER_BLOCK_IND, opts.statementType ?? 0));
-      cps.push(buildRawCP(CodePoint.PARAMETER_MARKER_DATA, opts.parameterMarkerData));
+      const pmCp = opts.pmDescriptorHandle
+        ? CodePoint.EXTENDED_PARAMETER_MARKER_DATA
+        : CodePoint.PARAMETER_MARKER_DATA;
+      cps.push(buildRawCP(pmCp, opts.parameterMarkerData));
     }
-    if (opts.extendedParameterData) cps.push(buildRawCP(CodePoint.EXTENDED_COLUMN_DESCRIPTORS, opts.extendedParameterData));
 
     let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA;
     if (opts.requestOutputData) orsBitmap |= ORSBitmap.RESULT_DATA;
@@ -953,19 +976,26 @@ export class DBRequestDS {
     // Packaged execution repeats PACKAGE_NAME. The library is already
     // bound on CREATE_RPB.
     if (opts.packageName) cps.push(buildTextCP(CodePoint.PACKAGE_NAME, opts.packageName, identifierCcsid));
-    // Include inline parameter format (0x3801) if provided
-    if (opts.parameterMarkerFormat) cps.push(buildRawCP(0x3801, opts.parameterMarkerFormat));
-    // Parameter marker data
+    // Per JTOpen: send PARAMETER_MARKER_BLOCK_IND before parameter data.
+    // Use 0x381F (extended) when CHANGE_DESCRIPTOR registered extended
+    // format (0x381E); use 0x3811 (original) otherwise.
     if (opts.parameterMarkerData) {
-      cps.push(buildRawCP(CodePoint.PARAMETER_MARKER_DATA, opts.parameterMarkerData));
+      cps.push(buildShortCP(CodePoint.PARAMETER_MARKER_BLOCK_IND, opts.statementType ?? 0));
+      const pmCp = opts.pmDescriptorHandle
+        ? CodePoint.EXTENDED_PARAMETER_MARKER_DATA
+        : CodePoint.PARAMETER_MARKER_DATA;
+      cps.push(buildRawCP(pmCp, opts.parameterMarkerData));
     }
 
     const template = Buffer.alloc(TEMPLATE_LENGTH);
-    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA
+    // jtopenlite OPEN bitmap: SEND_REPLY_IMMED | DATA_FORMAT | REPLY_RLE_COMPRESSED
+    // We add SQLCA + message CPs for richer error diagnostics.
+    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT
+                  | ORSBitmap.SQLCA | ORSBitmap.REPLY_RLE_COMPRESSED
                   | ORSBitmap.MESSAGE_ID | ORSBitmap.FIRST_LEVEL_TEXT | ORSBitmap.SECOND_LEVEL_TEXT;
     let requestId = RequestID.OPEN_AND_DESCRIBE;
     if (opts.requestResultData) {
-      orsBitmap |= ORSBitmap.DATA_FORMAT | ORSBitmap.RESULT_DATA;
+      orsBitmap |= ORSBitmap.RESULT_DATA;
       requestId = RequestID.OPEN_DESCRIBE_FETCH;
     }
     writeTemplate(template, 0, {
@@ -1135,94 +1165,6 @@ export class DBRequestDS {
   }
 
   /**
-   * Build change-descriptor request (register parameter format with server).
-   * Must be sent before executing statements with parameter markers.
-   *
-   * Per JTOpen DBSQLDescriptorDS.java + DBOriginalDataFormat.java:
-   * Uses request ID 0x1E00, sends parameter format as code point 0x3801
-   * (original format: 8-byte header + 54 bytes per field).
-   *
-   * @param {object} opts
-   * @param {number} opts.rpbId - RPB/statement ID
-   * @param {number} opts.descriptorHandle - descriptor handle (typically = rpbId)
-   * @param {object[]} opts.descriptors - parameter descriptors from prepare reply
-   * @param {number} opts.recordSize - total record size from prepare reply
-   * @returns {Buffer}
-   */
-  static buildChangeDescriptor(opts) {
-    const { rpbId, descriptorHandle, descriptors, recordSize } = opts;
-
-    // Construct DBOriginalDataFormat (per AS400JDBCPreparedStatementImpl.changeDescriptor).
-    // CRITICAL: The REQUEST format (DBOriginalDataFormat) has a DIFFERENT byte layout
-    // than the REPLY format (0x3808). Specifically:
-    //   Reply:   byte 6=precision, byte 8=scale, byte 12=dateTimeFormat
-    //   Request: byte 6=scale,     byte 8=precision, byte 12=parameterType
-    const numFields = descriptors.length;
-    const FIELD_SIZE = 54;
-    const formatLen = 8 + numFields * FIELD_SIZE;
-    const formatBuf = Buffer.alloc(formatLen);
-
-    // Compute fieldLength and recordSize.
-    // Per JTOpen: recordSize = parameterTotalSize_ = sum of field lengths (data only).
-    // Null indicators are in a separate section of the 0x3811 data, NOT in recordSize.
-    const fieldLengths = descriptors.map(desc => desc.rawFieldLength ?? (desc.length || 0));
-    const computedRecordSize = fieldLengths.reduce((sum, len) => sum + len, 0);
-
-    // Header (8 bytes)
-    formatBuf.writeInt32BE(1, 0);                              // consistencyToken = 1
-    formatBuf.writeInt16BE(numFields, 4);                      // numberOfFields
-    formatBuf.writeInt16BE(computedRecordSize, 6);             // recordSize (includes indicators)
-
-    // Per-field (54 bytes each) — DBOriginalDataFormat layout
-    for (let i = 0; i < numFields; i++) {
-      const desc = descriptors[i];
-      const off = 8 + i * FIELD_SIZE;
-      formatBuf.writeInt16BE(FIELD_SIZE, off);                // +0: fieldDescriptionLength
-      formatBuf.writeInt16BE(desc.sqlType | 1, off + 2);     // +2: sqlType (| 1 = nullable)
-      formatBuf.writeInt16BE(fieldLengths[i], off + 4);       // +4: fieldLength (wire bytes)
-      formatBuf.writeInt16BE(desc.scale ?? 0, off + 6);      // +6: SCALE (not precision!)
-      formatBuf.writeInt16BE(desc.precision ?? 0, off + 8);  // +8: PRECISION (not scale!)
-      formatBuf.writeUInt16BE(desc.ccsid ?? 0, off + 10);    // +10: ccsid
-      formatBuf[off + 12] = 0xF0;                            // +12: parameterType = input
-      // +13-27: reserved (zeros from alloc)
-      // +28-29: fieldNameLength = 0 (zeros)
-      // +30-31: fieldNameCCSID = 0 (zeros)
-      // +32-53: fieldName = empty (zeros)
-    }
-
-    const cps = [buildRawCP(0x3801, formatBuf)];
-
-    // Per jtopenlite: CHANGE_DESCRIPTOR uses REPLY_RLE_COMPRESSED only,
-    // NOT SEND_REPLY_IMMED. The server processes it silently (no reply).
-    const template = Buffer.alloc(TEMPLATE_LENGTH);
-    writeTemplate(template, 0, {
-      orsBitmap: ORSBitmap.SEND_REPLY_IMMED,
-      rpbId,
-      pmDescriptorHandle: descriptorHandle,
-      paramCount: cps.length,
-    });
-
-    return assemblePacket(RequestID.CHANGE_DESCRIPTOR, TEMPLATE_LENGTH, template, cps);
-  }
-
-  /**
-   * Build delete-descriptor request (cleanup when statement closes).
-   * @param {object} opts
-   * @param {number} opts.rpbId
-   * @param {number} opts.descriptorHandle
-   * @returns {Buffer}
-   */
-  static buildDeleteDescriptor(opts) {
-    const template = Buffer.alloc(TEMPLATE_LENGTH);
-    writeTemplate(template, 0, {
-      orsBitmap: ORSBitmap.SEND_REPLY_IMMED,
-      rpbId: opts.rpbId,
-      pmDescriptorHandle: opts.descriptorHandle,
-    });
-    return assemblePacket(RequestID.DELETE_DESCRIPTOR, TEMPLATE_LENGTH, template, []);
-  }
-
-  /**
    * Build a DBOriginalDataFormat buffer for parameter descriptors.
    * Can be used inline in OPEN/EXECUTE requests or in CHANGE_DESCRIPTOR.
    * @param {object[]} descriptors - parameter descriptors from prepare reply
@@ -1254,6 +1196,134 @@ export class DBRequestDS {
     }
 
     return formatBuf;
+  }
+
+  /**
+   * Build an extended parameter marker data format buffer for
+   * CHANGE_DESCRIPTOR (code point 0x381E).
+   *
+   * Layout matches jtopenlite JDBCParameterMetaData.getExtendedSQLParameterMarkerDataFormat:
+   *   +0:  int32 consistency token (1)
+   *   +4:  int32 number of fields
+   *   +8:  int32 reserved (0)
+   *   +12: int32 record size (sum of all field lengths)
+   *   +16: 64 bytes per field
+   *
+   * @param {object[]} descriptors
+   * @returns {Buffer}
+   */
+  /**
+   * Build an original (0x3801) parameter marker data format buffer.
+   * Layout: 8-byte header + 54 bytes per field.
+   * Used by CHANGE_DESCRIPTOR when extended formats are not desired.
+   */
+  static buildOriginalParameterFormat(descriptors) {
+    const numFields = descriptors.length;
+    const FIELD_SIZE = 54;
+    const buf = Buffer.alloc(8 + numFields * FIELD_SIZE);
+    const fieldLengths = descriptors.map(d => d.rawFieldLength ?? d.length ?? 0);
+    const recordSize = fieldLengths.reduce((s, l) => s + l, 0);
+    buf.writeInt32BE(1, 0);                   // consistency token
+    buf.writeInt16BE(numFields, 4);           // number of fields (int16!)
+    buf.writeInt16BE(recordSize & 0xFFFF, 6); // record size (int16!)
+    for (let i = 0; i < numFields; i++) {
+      const d = descriptors[i];
+      const off = 8 + i * FIELD_SIZE;
+      const absType = Math.abs(d.sqlType) & 0xFFFE;
+      const scale = (absType === 484 || absType === 488) ? (d.scale ?? 0) : 0;
+      buf.writeInt16BE(FIELD_SIZE, off);                       // desc length
+      buf.writeInt16BE(d.sqlType | 1, off + 2);                // SQL type (nullable)
+      buf.writeInt16BE(fieldLengths[i] & 0xFFFF, off + 4);     // field length (int16!)
+      buf.writeInt16BE(scale, off + 6);
+      buf.writeInt16BE(d.precision ?? 0, off + 8);
+      buf.writeUInt16BE(d.ccsid ?? 0, off + 10);
+      // +12: parameter type (1 byte) = 0
+      // +20: field name length (int16) = 0
+      // +22: field name CCSID (int16) = 0
+      // +24: field name (30 bytes) = zeros
+    }
+    return buf;
+  }
+
+  static buildExtendedParameterFormat(descriptors) {
+    const numFields = descriptors.length;
+    const FIELD_SIZE = 64;
+    const buf = Buffer.alloc(16 + numFields * FIELD_SIZE);
+    const fieldLengths = descriptors.map(d => d.rawFieldLength ?? d.length ?? 0);
+    const recordSize = fieldLengths.reduce((s, l) => s + l, 0);
+    buf.writeInt32BE(1, 0);            // consistency token
+    buf.writeInt32BE(numFields, 4);    // number of fields
+    buf.writeInt32BE(0, 8);            // reserved
+    buf.writeInt32BE(recordSize, 12);  // record size
+    for (let i = 0; i < numFields; i++) {
+      const d = descriptors[i];
+      const off = 16 + i * FIELD_SIZE;
+      const absType = Math.abs(d.sqlType) & 0xFFFE;
+      // JTOpen changeDescriptor uses sqlData.getScale() which returns 0 for
+      // all types except DECIMAL(484)/NUMERIC(488). The PREPARE reply may put
+      // the character length in the scale field for string types, but the
+      // CHANGE_DESCRIPTOR format must use the SQL-level scale (0 for strings).
+      const scale = (absType === 484 || absType === 488)
+        ? (d.scale ?? 0) : 0;
+      buf.writeInt16BE(FIELD_SIZE, off);           // desc length
+      buf.writeInt16BE(d.sqlType | 1, off + 2);    // SQL type (nullable)
+      buf.writeInt32BE(fieldLengths[i], off + 4);  // field length (4 bytes in extended)
+      buf.writeInt16BE(scale, off + 8);
+      buf.writeInt16BE(d.precision ?? 0, off + 10);
+      buf.writeUInt16BE(d.ccsid ?? 0, off + 12);
+      // remaining 50 bytes are zero (reserved/padding)
+    }
+    return buf;
+  }
+
+  /**
+   * Build CHANGE_DESCRIPTOR (0x1E00) — registers a parameter marker
+   * data format on the server under the given descriptor handle.
+   *
+   * The handle is then used in OPEN/EXECUTE templates so the server
+   * knows how to decode the parameter marker data.
+   *
+   * @param {object} opts
+   * @param {number} opts.descriptorHandle
+   * @param {number} opts.rpbId - RPB handle (jtopenlite always passes currentRPB_)
+   * @param {Buffer} opts.extendedParameterFormat - built by buildExtendedParameterFormat
+   * @returns {Buffer}
+   */
+  static buildChangeDescriptor(opts) {
+    const cps = [];
+    // Code point 0x381E = Extended SQL Parameter Marker Data Format
+    // Code point 0x3801 = Original SQL Parameter Marker Data Format
+    if (opts.originalParameterFormat) {
+      cps.push(buildRawCP(0x3801, opts.originalParameterFormat));
+    } else if (opts.extendedParameterFormat) {
+      cps.push(buildRawCP(0x381E, opts.extendedParameterFormat));
+    }
+    const template = Buffer.alloc(TEMPLATE_LENGTH);
+    // Use SEND_REPLY_IMMED so we can verify success before sending OPEN.
+    writeTemplate(template, 0, {
+      orsBitmap: ORSBitmap.SEND_REPLY_IMMED,
+      rpbId: opts.rpbId ?? 0,
+      pmDescriptorHandle: opts.descriptorHandle,
+      paramCount: cps.length,
+    });
+    return assemblePacket(RequestID.CHANGE_DESCRIPTOR, TEMPLATE_LENGTH, template, cps);
+  }
+
+  /**
+   * Build DELETE_DESCRIPTOR (0x1E01) — releases a server-side
+   * parameter marker descriptor handle.
+   *
+   * @param {object} opts
+   * @param {number} opts.descriptorHandle
+   * @returns {Buffer}
+   */
+  static buildDeleteDescriptor(opts) {
+    const template = Buffer.alloc(TEMPLATE_LENGTH);
+    writeTemplate(template, 0, {
+      orsBitmap: ORSBitmap.SEND_REPLY_IMMED,
+      pmDescriptorHandle: opts.descriptorHandle,
+    });
+    return assemblePacket(RequestID.DELETE_DESCRIPTOR, TEMPLATE_LENGTH, template, []);
   }
 
   /**

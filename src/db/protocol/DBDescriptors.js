@@ -552,10 +552,21 @@ export function parseSuperExtendedDataFormat(buf) {
       }
     }
 
+    // Normalize length for variable-length types: the super-extended
+    // format's fieldLength includes the 2-byte length prefix (same as
+    // the basic format), but decoders expect desc.length = data-only
+    // bytes. JTOpen SQLDataFactory.newData always subtracts 2 for
+    // VARCHAR/VARGRAPHIC/LONGVARCHAR/LONGGRAPHIC/VARBINARY.
+    const absType = Math.abs(fp.sqlType) & 0xFFFE;
+    const isVarLen = absType === 448 || absType === 464 || absType === 456
+                  || absType === 472 || absType === 908;
+    const normalizedLength = isVarLen && fp.length >= 2 ? fp.length - 2 : fp.length;
+
     descriptors.push({
       index: i,
       sqlType: fp.sqlType,
-      length: fp.length,
+      length: normalizedLength,
+      rawFieldLength: fp.length,
       scale: fp.scale,
       precision: fp.precision,
       ccsid: fp.ccsid,

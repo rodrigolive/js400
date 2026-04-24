@@ -11690,7 +11690,9 @@ class StatementManager {
         descriptorHandle: stmt.descriptorHandle,
         extendedParameterFormat: extParamFmt
       });
-      await this.#connection.send(cdBuf);
+      const cdReplyBuf = await this.#connection.sendAndReceive(cdBuf);
+      const cdReply = parseOperationReply(cdReplyBuf, { serverCCSID: this.#serverCCSID });
+      throwIfError(cdReply.sqlca, "Change descriptor (batch)");
       stmt.lastSentWidths = widthsSig;
     }
     const isInsert = inferStatementType(stmt.sql) === StatementType.OTHER && /^\s*(?:--[^\n]*\n|\/\*[\s\S]*?\*\/|\s)*INSERT\b/i.test(stmt.sql);
@@ -11833,7 +11835,7 @@ class StatementManager {
   #encodeParametersBatchInto(paramSets, descriptors, rowStart, rowCount, rowSize, buf, baseOffset) {
     const columnCount = descriptors.length;
     const indicatorSize = 2;
-    const headerSize = 14;
+    const headerSize = 20;
     const indicatorBlockSize = rowCount * columnCount * indicatorSize;
     buf.writeInt32BE(1, baseOffset);
     buf.writeInt32BE(rowCount, baseOffset + 4);

@@ -869,8 +869,9 @@ export class StatementManager {
         descriptorHandle: stmt.descriptorHandle,
         extendedParameterFormat: extParamFmt,
       });
-      // Fire-and-forget (JTOpen JDBC: ORS bitmap=0, no reply).
-      await this.#connection.send(cdBuf);
+      const cdReplyBuf = await this.#connection.sendAndReceive(cdBuf);
+      const cdReply = parseOperationReply(cdReplyBuf, { serverCCSID: this.#serverCCSID });
+      throwIfError(cdReply.sqlca, 'Change descriptor (batch)');
       stmt.lastSentWidths = widthsSig;
     }
 
@@ -1152,7 +1153,7 @@ export class StatementManager {
   #encodeParametersBatchInto(paramSets, descriptors, rowStart, rowCount, rowSize, buf, baseOffset) {
     const columnCount = descriptors.length;
     const indicatorSize = 2;
-    const headerSize = 14;
+    const headerSize = 20;
     const indicatorBlockSize = rowCount * columnCount * indicatorSize;
 
     // DBExtendedData header (20 bytes) at baseOffset

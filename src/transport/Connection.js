@@ -34,6 +34,15 @@ export class Connection {
   #connected = false;
   /** @type {string|null} */
   #jobString = null;
+  /**
+   * Async mutex — serializes all protocol operations on this socket.
+   * The IBM i database host-server protocol has no request/reply
+   * correlation; replies arrive in request order. Concurrent callers
+   * sharing one Connection must be serialized to prevent reply desync.
+   * JTOpen does the same with `internalLock_` / `synchronized`.
+   * @type {Promise<void>}
+   */
+  #lock = Promise.resolve();
 
   /**
    * @param {object} opts
@@ -137,12 +146,43 @@ export class Connection {
   /**
    * Send a request and wait for a correlated reply.
    *
+   * Acquires the connection-level lock so concurrent callers on the same
+   * socket are serialized (prevents reply desync).
+   *
    * @param {Buffer} request - Full datastream to send
    * @returns {Promise<Buffer>} Reply datastream
    */
   async sendAndReceive(request) {
-    await this.send(request);
-    return this.receive();
+    return this.withLock(async () => {
+      await this.send(request);
+      return this.receive();
+    });
+  }
+
+  /**
+   * Execute `fn` while holding the connection-level mutex.
+   *
+   * Use this to wrap multi-step protocol sequences (e.g.
+   * CHANGE_DESCRIPTOR + EXECUTE) that must not be interleaved with
+   * other callers sharing the same socket. Within the callback, use
+   * the raw `send()` / `receive()` methods (NOT `sendAndReceive`,
+   * which would re-acquire the lock and deadlock).
+   *
+   * @template T
+   * @param {() => Promise<T>} fn
+   * @returns {Promise<T>}
+   */
+  async withLock(fn) {
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const prev = this.#lock;
+    this.#lock = gate;
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
   }
 
   /**

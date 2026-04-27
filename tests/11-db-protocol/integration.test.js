@@ -15,42 +15,50 @@ import { parseColumnDescriptors, SqlType } from '../../src/db/protocol/DBDescrip
 import { decodeRows, encodeValue, getTypeHandler } from '../../src/db/types/factory.js';
 import { DataStream } from '../../src/transport/DataStream.js';
 
-/** Build a synthetic server reply buffer. */
+/** Build a synthetic server reply buffer.
+ *
+ * The real server sends SQLCA as code point 0x3807 (with 12-byte
+ * SQLCAID+SQLCABC header) and uses a 20-byte reply template for
+ * ORS bitmap, RC class, etc. This helper mirrors that layout.
+ */
 function buildServerReply({
   reqRepId = 0x1001,
   sqlCode = 0,
   sqlState = '00000',
   rowCount = 0,
-  templateExtra = null,
   codePoints = [],
 } = {}) {
-  // Build SQLCA (124 bytes)
-  const sqlca = Buffer.alloc(SQLCA_LENGTH, 0);
-  sqlca.writeInt32BE(sqlCode, 0);
-  // SQLERRD[2] = rowCount
-  sqlca.writeInt32BE(rowCount, 84 + 2 * 4);
-  // SQLSTATE at offset 119 (5 bytes, ASCII)
+  // Build SQLCA body (124 bytes, no SQLCAID/SQLCABC header)
+  const sqlcaBody = Buffer.alloc(SQLCA_LENGTH, 0);
+  sqlcaBody.writeInt32BE(sqlCode, 0);
+  sqlcaBody.writeInt32BE(rowCount, 84 + 2 * 4); // SQLERRD[2]
   for (let i = 0; i < Math.min(sqlState.length, 5); i++) {
-    sqlca[119 + i] = sqlState.charCodeAt(i);
+    sqlcaBody[119 + i] = sqlState.charCodeAt(i);
   }
 
-  const template = templateExtra
-    ? Buffer.concat([sqlca, templateExtra])
-    : sqlca;
+  // Wrap in 0x3807 code point: SQLCAID(8) + SQLCABC(4) + body(124) = 136
+  const sqlcaCpData = Buffer.alloc(12 + SQLCA_LENGTH, 0);
+  sqlcaBody.copy(sqlcaCpData, 12);
+  const sqlcaCp = buildCP(0x3807, sqlcaCpData);
 
+  // 20-byte reply template (ORS bitmap, RC class, etc.)
+  const REPLY_TEMPLATE_LEN = 20;
+  const template = Buffer.alloc(REPLY_TEMPLATE_LEN, 0);
+
+  const allCPs = [sqlcaCp, ...codePoints];
   let cpLen = 0;
-  for (const cp of codePoints) cpLen += cp.length;
+  for (const cp of allCPs) cpLen += cp.length;
 
-  const totalLen = 20 + template.length + cpLen;
+  const totalLen = 20 + REPLY_TEMPLATE_LEN + cpLen;
   const buf = Buffer.alloc(totalLen);
   buf.writeInt32BE(totalLen, 0);
   buf.writeUInt16BE(0xE004, 6);
-  buf.writeInt16BE(template.length, 16);
+  buf.writeInt16BE(REPLY_TEMPLATE_LEN, 16);
   buf.writeUInt16BE(reqRepId, 18);
   template.copy(buf, 20);
 
-  let offset = 20 + template.length;
-  for (const cp of codePoints) {
+  let offset = 20 + REPLY_TEMPLATE_LEN;
+  for (const cp of allCPs) {
     cp.copy(buf, offset);
     offset += cp.length;
   }
@@ -77,25 +85,34 @@ describe('request → reply round-trip', () => {
 
     // Verify request
     expect(reqBuf.readUInt16BE(6)).toBe(0xE004);
-    expect(reqBuf.readUInt16BE(18)).toBe(RequestID.EXCHANGE_ATTRIBUTES);
+    expect(reqBuf.readUInt16BE(18)).toBe(RequestID.SET_SERVER_ATTRIBUTES);
 
-    // Build synthetic reply
-    const template = Buffer.alloc(18, 0);
-    template.writeUInt16BE(0x0F, 0);   // attributes
-    template.writeInt32BE(37, 2);      // server CCSID
-    template.writeInt32BE(10, 6);      // DS level
-    template.writeUInt16BE(3, 10);     // access level
+    // Build synthetic reply with server attributes in 0x3804 CP
+    // and datastream level in 0x3A01 CP
+    const attrData = Buffer.alloc(23, 0);
+    attrData.writeUInt16BE(0x0F, 0);   // server attributes
+    attrData.writeUInt16BE(37, 21);    // server CCSID at offset 21
 
-    const replyBuf = Buffer.alloc(20 + 18);
-    replyBuf.writeInt32BE(20 + 18, 0);
+    const dsLevelData = Buffer.alloc(4, 0);
+    dsLevelData.writeInt32BE(10, 0);
+
+    const REPLY_TEMPLATE_LEN = 20;
+    const template = Buffer.alloc(REPLY_TEMPLATE_LEN, 0);
+    const attrCp = buildCP(0x3804, attrData);
+    const dsLevelCp = buildCP(0x3A01, dsLevelData);
+
+    const replyBuf = Buffer.alloc(20 + REPLY_TEMPLATE_LEN + attrCp.length + dsLevelCp.length);
+    replyBuf.writeInt32BE(replyBuf.length, 0);
     replyBuf.writeUInt16BE(0xE004, 6);
-    replyBuf.writeInt16BE(18, 16);
-    replyBuf.writeUInt16BE(RequestID.EXCHANGE_ATTRIBUTES, 18);
+    replyBuf.writeInt16BE(REPLY_TEMPLATE_LEN, 16);
+    replyBuf.writeUInt16BE(RequestID.SET_SERVER_ATTRIBUTES, 18);
     template.copy(replyBuf, 20);
+    attrCp.copy(replyBuf, 20 + REPLY_TEMPLATE_LEN);
+    dsLevelCp.copy(replyBuf, 20 + REPLY_TEMPLATE_LEN + attrCp.length);
 
     const reply = parseReply(replyBuf);
-    expect(reply.template.length).toBe(18);
-    expect(reply.template.readInt32BE(2)).toBe(37);
+    expect(reply.template.length).toBe(REPLY_TEMPLATE_LEN);
+    expect(reply.codePoints.has(0x3804)).toBe(true);
   });
 
   test('execute immediate request and success reply', () => {
@@ -277,10 +294,9 @@ describe('fetch flow simulation', () => {
     const h = DataStream.parseHeader(buf);
     expect(h.reqRepId).toBe(RequestID.FETCH);
 
-    // Verify template RPB ID
+    // Verify template RPB ID (at offset 14 = RPB handle in the 20-byte template)
     const template = buf.subarray(20, 20 + 20);
-    expect(template.readInt16BE(4)).toBe(5); // rpbId
-    expect(template.readInt16BE(8)).toBe(50); // operationByte (fetchCount)
+    expect(template.readInt16BE(14)).toBe(5); // rpbId
   });
 
   test('end-of-data reply (SQLCODE 100)', () => {

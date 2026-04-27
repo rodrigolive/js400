@@ -15,7 +15,6 @@ beforeEach(() => {
 
 const HEADER_LEN = 20;
 const TEMPLATE_LEN = 20;
-const EXCH_TEMPLATE_LEN = 14;
 const SERVER_ID = 0xE004;
 
 function parseHeader(buf) {
@@ -48,28 +47,32 @@ describe('DBRequestDS', () => {
       const buf = DBRequestDS.buildExchangeAttributes();
       const h = parseHeader(buf);
       expect(h.serverId).toBe(SERVER_ID);
-      expect(h.reqRepId).toBe(RequestID.EXCHANGE_ATTRIBUTES);
-      expect(h.templateLen).toBe(EXCH_TEMPLATE_LEN);
+      expect(h.reqRepId).toBe(RequestID.SET_SERVER_ATTRIBUTES);
+      expect(h.templateLen).toBe(TEMPLATE_LEN);
     });
 
-    test('template contains client CCSID 13488', () => {
+    test('includes client CCSID in code points', () => {
       const buf = DBRequestDS.buildExchangeAttributes({ ccsid: 13488 });
-      const template = buf.subarray(HEADER_LEN, HEADER_LEN + EXCH_TEMPLATE_LEN);
-      expect(template.readInt32BE(6)).toBe(13488);
+      // CCSID sent as first CP (0x3801 = LIBRARY_NAME in request namespace, reused for Default Client CCSID)
+      const cps = parseCodePoints(buf, TEMPLATE_LEN);
+      const ccsidCp = cps.find(c => c.cp === 0x3801);
+      expect(ccsidCp).toBeDefined();
+      expect(ccsidCp.data.readInt16BE(0)).toBe(13488);
     });
 
     test('includes CLIENT_DATASTREAM_LEVEL code point', () => {
       const buf = DBRequestDS.buildExchangeAttributes({ datastreamLevel: 7 });
-      const cps = parseCodePoints(buf, EXCH_TEMPLATE_LEN);
-      expect(cps.length).toBe(1);
-      expect(cps[0].cp).toBe(CodePoint.CLIENT_DATASTREAM_LEVEL);
-      expect(cps[0].data.readInt32BE(0)).toBe(7);
+      const cps = parseCodePoints(buf, TEMPLATE_LEN);
+      const dslCp = cps.find(c => c.cp === CodePoint.CLIENT_DATASTREAM_LEVEL);
+      expect(dslCp).toBeDefined();
+      expect(dslCp.data.readInt32BE(0)).toBe(7);
     });
 
     test('default datastream level is 5', () => {
       const buf = DBRequestDS.buildExchangeAttributes();
-      const cps = parseCodePoints(buf, EXCH_TEMPLATE_LEN);
-      expect(cps[0].data.readInt32BE(0)).toBe(5);
+      const cps = parseCodePoints(buf, TEMPLATE_LEN);
+      const dslCp = cps.find(c => c.cp === CodePoint.CLIENT_DATASTREAM_LEVEL);
+      expect(dslCp.data.readInt32BE(0)).toBe(5);
     });
   });
 
@@ -84,7 +87,9 @@ describe('DBRequestDS', () => {
     test('template carries RPB ID', () => {
       const buf = DBRequestDS.buildCreateRPB({ rpbId: 42 });
       const template = buf.subarray(HEADER_LEN, HEADER_LEN + TEMPLATE_LEN);
-      expect(template.readInt16BE(4)).toBe(42);
+      // RPB handle at template offset 14; also at offset 8 (Return ORS) and 10 (Fill ORS)
+      expect(template.readInt16BE(14)).toBe(42);
+      expect(template.readInt16BE(8)).toBe(42);
     });
 
     test('includes translate indicator CP', () => {
@@ -124,16 +129,20 @@ describe('DBRequestDS', () => {
   });
 
   describe('buildPrepareAndDescribe', () => {
-    test('includes SQL text code point', () => {
+    // buildPrepareAndDescribe uses EXTENDED_SQL_STATEMENT_TEXT (0x3831)
+    // with layout: CCSID(2) + textLength(4) + UTF-16BE text
+    const EXT_SQL_TEXT_CP = 0x3831;
+
+    test('includes extended SQL text code point', () => {
       const buf = DBRequestDS.buildPrepareAndDescribe({
         rpbId: 1,
         sqlText: 'SELECT 1',
       });
       const cps = parseCodePoints(buf, TEMPLATE_LEN);
-      const sqlCp = cps.find(c => c.cp === CodePoint.SQL_STATEMENT_TEXT);
+      const sqlCp = cps.find(c => c.cp === EXT_SQL_TEXT_CP);
       expect(sqlCp).toBeDefined();
-      // Text CP has 4-byte CCSID prefix then UTF-16BE text
-      expect(sqlCp.data.readInt32BE(0)).toBe(13488);
+      // 2-byte CCSID prefix = 13488
+      expect(sqlCp.data.readUInt16BE(0)).toBe(13488);
     });
 
     test('uses correct request ID', () => {
@@ -145,10 +154,10 @@ describe('DBRequestDS', () => {
     test('encodes SQL text as UTF-16BE', () => {
       const buf = DBRequestDS.buildPrepareAndDescribe({ rpbId: 1, sqlText: 'AB' });
       const cps = parseCodePoints(buf, TEMPLATE_LEN);
-      const sqlCp = cps.find(c => c.cp === CodePoint.SQL_STATEMENT_TEXT);
-      // After 4-byte CCSID, UTF-16BE for 'A' = 0x0041, 'B' = 0x0042
-      expect(sqlCp.data.readUInt16BE(4)).toBe(0x0041);
-      expect(sqlCp.data.readUInt16BE(6)).toBe(0x0042);
+      const sqlCp = cps.find(c => c.cp === EXT_SQL_TEXT_CP);
+      // After CCSID(2) + textLength(4), UTF-16BE for 'A' = 0x0041, 'B' = 0x0042
+      expect(sqlCp.data.readUInt16BE(6)).toBe(0x0041);
+      expect(sqlCp.data.readUInt16BE(8)).toBe(0x0042);
     });
 
     test('includes describe option CP when specified', () => {
@@ -159,7 +168,8 @@ describe('DBRequestDS', () => {
       const cps = parseCodePoints(buf, TEMPLATE_LEN);
       const doCp = cps.find(c => c.cp === CodePoint.DESCRIBE_OPTION);
       expect(doCp).toBeDefined();
-      expect(doCp.data.readInt16BE(0)).toBe(DescribeOption.BOTH);
+      // buildByteCP: 1 byte value
+      expect(doCp.data[0]).toBe(DescribeOption.BOTH);
     });
   });
 
@@ -185,16 +195,20 @@ describe('DBRequestDS', () => {
       expect(h.reqRepId).toBe(RequestID.FETCH);
     });
 
-    test('places fetch count in operation byte of template', () => {
+    test('places fetch count in BLOCKING_FACTOR code point', () => {
       const buf = DBRequestDS.buildFetch({ rpbId: 1, fetchCount: 50 });
-      const template = buf.subarray(HEADER_LEN, HEADER_LEN + TEMPLATE_LEN);
-      expect(template.readInt16BE(8)).toBe(50);
+      const cps = parseCodePoints(buf, TEMPLATE_LEN);
+      const bfCp = cps.find(c => c.cp === CodePoint.BLOCKING_FACTOR);
+      expect(bfCp).toBeDefined();
+      expect(bfCp.data.readInt32BE(0)).toBe(50);
     });
 
     test('default fetch count is 1', () => {
       const buf = DBRequestDS.buildFetch({ rpbId: 1 });
-      const template = buf.subarray(HEADER_LEN, HEADER_LEN + TEMPLATE_LEN);
-      expect(template.readInt16BE(8)).toBe(1);
+      const cps = parseCodePoints(buf, TEMPLATE_LEN);
+      const bfCp = cps.find(c => c.cp === CodePoint.BLOCKING_FACTOR);
+      expect(bfCp).toBeDefined();
+      expect(bfCp.data.readInt32BE(0)).toBe(1);
     });
   });
 
@@ -304,19 +318,19 @@ describe('DBRequestDS', () => {
     });
   });
 
-  describe('template consistency bytes', () => {
-    test('all standard templates start with 0x000D0006', () => {
+  describe('template consistency', () => {
+    test('reply-only requests use SEND_REPLY_IMMED ORS bitmap', () => {
+      // These operations only request a reply, no SQLCA or data
       const bufs = [
         DBRequestDS.buildCreateRPB({ rpbId: 1 }),
         DBRequestDS.buildDeleteRPB({ rpbId: 1 }),
         DBRequestDS.buildCommit(),
         DBRequestDS.buildRollback(),
-        DBRequestDS.buildFetch({ rpbId: 1 }),
         DBRequestDS.buildCloseCursor({ rpbId: 1 }),
       ];
       for (const buf of bufs) {
-        const template = buf.subarray(HEADER_LEN, HEADER_LEN + 4);
-        expect(template.readInt32BE(0)).toBe(0x000D0006);
+        const orsBitmap = buf.readUInt32BE(HEADER_LEN);
+        expect(orsBitmap).toBe(0x80000000); // SEND_REPLY_IMMED
       }
     });
   });

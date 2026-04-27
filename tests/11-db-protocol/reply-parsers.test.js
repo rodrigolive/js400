@@ -154,33 +154,50 @@ describe('parseSQLCA', () => {
 
 describe('parseExchangeAttributes', () => {
   test('parses server CCSID and datastream level', () => {
-    const template = Buffer.alloc(18, 0);
-    template.writeUInt16BE(0x0F, 0); // server attributes
-    template.writeInt32BE(37, 2);    // server CCSID
-    template.writeInt32BE(10, 6);    // server datastream level
-    template.writeUInt16BE(3, 10);   // access level
+    // Parser reads from 0x3804 (SERVER_ATTRIBUTES) CP and 0x3A01 (DATASTREAM_LEVEL) CP.
+    // 0x3804 layout: +0 serverAttributes(2), +21 serverCCSID(2)
+    const attrData = Buffer.alloc(23, 0);
+    attrData.writeUInt16BE(0x0F, 0);   // server attributes
+    attrData.writeUInt16BE(37, 21);    // server CCSID at offset 21
 
-    const buf = buildReplyBuf({ templateLen: 18, template });
+    const dsLevelData = Buffer.alloc(4, 0);
+    dsLevelData.writeInt32BE(10, 0);
+
+    const template = Buffer.alloc(20, 0); // standard 20-byte reply template
+    const buf = buildReplyBuf({
+      templateLen: 20,
+      template,
+      codePoints: [buildCP(0x3804, attrData), buildCP(0x3A01, dsLevelData)],
+    });
     const result = parseExchangeAttributes(buf);
 
     expect(result.serverAttributes).toBe(0x0F);
     expect(result.serverCCSID).toBe(37);
     expect(result.serverDatastreamLevel).toBe(10);
-    expect(result.accessLevel).toBe(3);
   });
 
-  test('throws on too-short template', () => {
-    const template = Buffer.alloc(8, 0);
-    const buf = buildReplyBuf({ templateLen: 8, template });
-    expect(() => parseExchangeAttributes(buf)).toThrow('too short');
+  test('returns defaults when no server attributes CP present', () => {
+    const template = Buffer.alloc(20, 0);
+    const buf = buildReplyBuf({ templateLen: 20, template });
+    const result = parseExchangeAttributes(buf);
+    expect(result.serverCCSID).toBe(37);
+    expect(result.serverDatastreamLevel).toBe(0);
   });
 });
 
 describe('parseOperationReply', () => {
-  test('extracts SQLCA from template', () => {
-    const template = Buffer.alloc(SQLCA_LENGTH, 0);
-    template.writeInt32BE(-802, 0); // SQLCODE = -802 (data conversion error)
-    const buf = buildReplyBuf({ templateLen: SQLCA_LENGTH, template });
+  test('extracts SQLCA from 0x3807 code point', () => {
+    // SQLCA is in CP 0x3807 with 12-byte SQLCAID+SQLCABC header
+    const sqlcaBody = Buffer.alloc(SQLCA_LENGTH, 0);
+    sqlcaBody.writeInt32BE(-802, 0); // SQLCODE = -802 (data conversion error)
+    const sqlcaCpData = Buffer.alloc(12 + SQLCA_LENGTH, 0);
+    sqlcaBody.copy(sqlcaCpData, 12);
+
+    const template = Buffer.alloc(20, 0); // standard reply template
+    const buf = buildReplyBuf({
+      templateLen: 20, template,
+      codePoints: [buildCP(0x3807, sqlcaCpData)],
+    });
 
     const reply = parseOperationReply(buf);
     expect(reply.sqlca.sqlCode).toBe(-802);
@@ -188,11 +205,15 @@ describe('parseOperationReply', () => {
   });
 
   test('extracts code points alongside SQLCA', () => {
-    const template = Buffer.alloc(SQLCA_LENGTH, 0);
+    const sqlcaBody = Buffer.alloc(SQLCA_LENGTH, 0);
+    const sqlcaCpData = Buffer.alloc(12 + SQLCA_LENGTH, 0);
+    sqlcaBody.copy(sqlcaCpData, 12);
+
+    const template = Buffer.alloc(20, 0);
     const cpData = Buffer.from([0xFF]);
     const buf = buildReplyBuf({
-      templateLen: SQLCA_LENGTH, template,
-      codePoints: [buildCP(0x3812, cpData)],
+      templateLen: 20, template,
+      codePoints: [buildCP(0x3807, sqlcaCpData), buildCP(0x3812, cpData)],
     });
 
     const reply = parseOperationReply(buf);
@@ -253,12 +274,22 @@ describe('parseOperationReply', () => {
 });
 
 describe('parseFetchReply', () => {
+  /** Helper to build a 0x3807 SQLCA code point buffer. */
+  function buildSqlcaCP(sqlCode = 0, rowCount = 0) {
+    const body = Buffer.alloc(SQLCA_LENGTH, 0);
+    body.writeInt32BE(sqlCode, 0);
+    body.writeInt32BE(rowCount, 84 + 2 * 4);
+    const cpData = Buffer.alloc(12 + SQLCA_LENGTH, 0);
+    body.copy(cpData, 12);
+    return buildCP(0x3807, cpData);
+  }
+
   test('extracts row data buffers from 0x380E code point', () => {
-    const template = Buffer.alloc(SQLCA_LENGTH, 0);
+    const template = Buffer.alloc(20, 0);
     const rowData = Buffer.from([0x01, 0x02, 0x03, 0x04]);
     const buf = buildReplyBuf({
-      templateLen: SQLCA_LENGTH, template,
-      codePoints: [buildCP(0x380E, rowData)],
+      templateLen: 20, template,
+      codePoints: [buildSqlcaCP(0), buildCP(0x380E, rowData)],
     });
 
     const reply = parseFetchReply(buf);
@@ -268,20 +299,22 @@ describe('parseFetchReply', () => {
   });
 
   test('detects end of data (SQLCODE 100)', () => {
-    const template = Buffer.alloc(SQLCA_LENGTH, 0);
-    template.writeInt32BE(100, 0); // SQLCODE 100 = end of data
-    const buf = buildReplyBuf({ templateLen: SQLCA_LENGTH, template });
+    const template = Buffer.alloc(20, 0);
+    const buf = buildReplyBuf({
+      templateLen: 20, template,
+      codePoints: [buildSqlcaCP(100)],
+    });
 
     const reply = parseFetchReply(buf);
     expect(reply.endOfData).toBe(true);
   });
 
   test('extracts extended descriptors from 0x3812 code point', () => {
-    const template = Buffer.alloc(SQLCA_LENGTH, 0);
+    const template = Buffer.alloc(20, 0);
     const descData = Buffer.from([0xAA, 0xBB]);
     const buf = buildReplyBuf({
-      templateLen: SQLCA_LENGTH, template,
-      codePoints: [buildCP(0x3812, descData)],
+      templateLen: 20, template,
+      codePoints: [buildSqlcaCP(0), buildCP(0x3812, descData)],
     });
 
     const reply = parseFetchReply(buf);
@@ -361,26 +394,27 @@ describe('throwIfError', () => {
 
 describe('decodeTextCodePoint', () => {
   test('decodes UTF-16BE text with CCSID 13488 prefix', () => {
+    // decodeTextCodePoint uses 2-byte CCSID prefix, then text bytes
     const text = 'Hello';
-    const textBuf = Buffer.alloc(4 + text.length * 2);
-    textBuf.writeInt32BE(13488, 0);
+    const textBuf = Buffer.alloc(2 + text.length * 2);
+    textBuf.writeUInt16BE(13488, 0);
     for (let i = 0; i < text.length; i++) {
-      textBuf.writeUInt16BE(text.charCodeAt(i), 4 + i * 2);
+      textBuf.writeUInt16BE(text.charCodeAt(i), 2 + i * 2);
     }
     expect(decodeTextCodePoint(textBuf)).toBe('Hello');
   });
 
   test('returns empty string for null/short data', () => {
     expect(decodeTextCodePoint(null)).toBe('');
-    expect(decodeTextCodePoint(Buffer.alloc(2))).toBe('');
+    expect(decodeTextCodePoint(Buffer.alloc(1))).toBe('');
   });
 
   test('handles CCSID 1200 as UTF-16BE', () => {
     const text = 'AB';
-    const textBuf = Buffer.alloc(4 + text.length * 2);
-    textBuf.writeInt32BE(1200, 0);
-    textBuf.writeUInt16BE(0x0041, 4);
-    textBuf.writeUInt16BE(0x0042, 6);
+    const textBuf = Buffer.alloc(2 + text.length * 2);
+    textBuf.writeUInt16BE(1200, 0);
+    textBuf.writeUInt16BE(0x0041, 2);
+    textBuf.writeUInt16BE(0x0042, 4);
     expect(decodeTextCodePoint(textBuf)).toBe('AB');
   });
 });

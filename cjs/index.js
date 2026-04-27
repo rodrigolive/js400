@@ -721,6 +721,7 @@ class Connection {
   #connectionId;
   #connected = false;
   #jobString = null;
+  #lock = Promise.resolve();
   constructor(opts) {
     this.#host = opts.host;
     this.#port = opts.port;
@@ -798,8 +799,24 @@ class Connection {
     return DataStream.readFrame(this.#socket);
   }
   async sendAndReceive(request) {
-    await this.send(request);
-    return this.receive();
+    return this.withLock(async () => {
+      await this.send(request);
+      return this.receive();
+    });
+  }
+  async withLock(fn) {
+    let release;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const prev = this.#lock;
+    this.#lock = gate;
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
   }
   close() {
     if (this.#socket) {

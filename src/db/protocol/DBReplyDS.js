@@ -462,14 +462,36 @@ export function parseOperationReply(buf, opts = {}) {
     sqlca = createEmptySQLCA();
   }
 
+  // Extract message text from reply code points 0x3801-0x3803.
+  // The server sends MESSAGE_ID, FIRST_LEVEL_TEXT, and SECOND_LEVEL_TEXT
+  // when the ORS bitmap requests them. These provide human-readable
+  // descriptions (e.g. "[SQL0803] Duplicate key value specified")
+  // that the bare SQLCA ERRMC tokens don't include.
+  const msgs = extractErrorMessages(reply.codePoints, serverCCSID);
+
+  // Enrich SQLCA with message text when available. The ERRMC field
+  // contains substitution tokens (table/key names), while the message
+  // code points contain the actual descriptive text. Combine them
+  // JTOpen-style: "[MSG_ID] first-level text".
+  if (sqlca.isError && (msgs.messageId || msgs.firstLevelText)) {
+    const parts = [];
+    if (msgs.messageId) parts.push(`[${msgs.messageId}]`);
+    if (msgs.firstLevelText) parts.push(msgs.firstLevelText);
+    const messageText = parts.join(' ');
+    sqlca = {
+      ...sqlca,
+      messageText,
+      secondLevelText: msgs.secondLevelText || '',
+      messageTokens: sqlca.messageTokens || messageText,
+    };
+  }
+
   // Check reply template for errors.
   // rcClass 0 = success, 2 = data returned (success).
   // rcClass 1 = error with details, 7 = server/resource error,
   // 8 = exit program error. All non-zero classes with negative
   // return codes are errors (per jtopenlite DatabaseException).
   if (tmpl.rcClass !== 0 && tmpl.rcClass !== 2 && tmpl.rcReturnCode < 0) {
-    // Server reported an error via the reply template
-    const msgs = extractErrorMessages(reply.codePoints, serverCCSID);
     // If we have an SQLCA, it already captures the error.
     // If not, synthesize one from the template error info.
     if (sqlca.isSuccess && !sqlca.isError) {
@@ -478,6 +500,8 @@ export function parseOperationReply(buf, opts = {}) {
         sqlCode: tmpl.rcReturnCode,
         sqlState: msgs.messageId || `RC${tmpl.rcClass}`,
         messageTokens: msgs.firstLevelText || msgs.secondLevelText || `RC class ${tmpl.rcClass}, return code ${tmpl.rcReturnCode}`,
+        messageText: msgs.firstLevelText || '',
+        secondLevelText: msgs.secondLevelText || '',
         isError: true,
         isSuccess: false,
       };
@@ -526,9 +550,13 @@ export function parseFetchReply(buf, opts = {}) {
  */
 export function throwIfError(sqlca, context) {
   if (sqlca.isError) {
+    // Build the error message JTOpen-style:
+    //   "Context: SQLCODE -803 SQLSTATE 23505 — [SQL0803] Duplicate key value specified"
+    // Falls back to ERRMC tokens when message text isn't available.
+    const detail = sqlca.messageText || sqlca.messageTokens;
     const msg = context
-      ? `${context}: SQLCODE ${sqlca.sqlCode} SQLSTATE ${sqlca.sqlState} — ${sqlca.messageTokens}`
-      : `SQLCODE ${sqlca.sqlCode} SQLSTATE ${sqlca.sqlState} — ${sqlca.messageTokens}`;
+      ? `${context}: SQLCODE ${sqlca.sqlCode} SQLSTATE ${sqlca.sqlState} — ${detail}`
+      : `SQLCODE ${sqlca.sqlCode} SQLSTATE ${sqlca.sqlState} — ${detail}`;
     throw new SqlError(msg, {
       returnCode: sqlca.sqlCode,
       messageId: sqlca.sqlState,
@@ -536,6 +564,8 @@ export function throwIfError(sqlca, context) {
       requestMetadata: {
         sqlCode: sqlca.sqlCode,
         sqlState: sqlca.sqlState,
+        messageText: sqlca.messageText || '',
+        secondLevelText: sqlca.secondLevelText || '',
         messageTokens: sqlca.messageTokens,
         rowCount: sqlca.rowCount,
         sqlerrd: sqlca.sqlerrd,

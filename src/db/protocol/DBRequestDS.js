@@ -201,6 +201,17 @@ export const ORSBitmap = Object.freeze({
 /** Default ORS bitmap: just request a reply. */
 const DEFAULT_ORS_BITMAP = ORSBitmap.SEND_REPLY_IMMED;
 
+/**
+ * Message-text bits to OR into any request that already carries SQLCA.
+ * When an error occurs, the server includes MESSAGE_ID (0x3801),
+ * FIRST_LEVEL_TEXT (0x3802), and SECOND_LEVEL_TEXT (0x3803) in the
+ * reply so throwIfError can surface a human-readable message instead
+ * of just a bare SQLCODE. JTOpen does the same via getReason().
+ */
+const MSG_TEXT_BITS = ORSBitmap.MESSAGE_ID
+                    | ORSBitmap.FIRST_LEVEL_TEXT
+                    | ORSBitmap.SECOND_LEVEL_TEXT;
+
 /** Unicode CCSID for text code points. */
 const UNICODE_CCSID = 13488;
 
@@ -573,7 +584,7 @@ export class DBRequestDS {
 
     const template = Buffer.alloc(TEMPLATE_LENGTH);
     writeTemplate(template, 0, {
-      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA,
+      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA | MSG_TEXT_BITS,
       rpbId: opts.rpbId ?? 0,
       paramCount: cps.length,
     });
@@ -711,7 +722,7 @@ export class DBRequestDS {
     // statements — without it the server may crash (rcClass=7/-101) when
     // describing wide result sets like SELECT *.
     const isCall = opts.statementType === 3; // StatementType.CALL
-    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT | ORSBitmap.SQLCA;
+    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT | ORSBitmap.SQLCA | MSG_TEXT_BITS;
     if (!isCall) orsBitmap |= ORSBitmap.EXTENDED_COLUMN_DESCRIPTORS;
     if (opts.parameterMarkerFormat === true) orsBitmap |= ORSBitmap.PARAMETER_MARKER_FORMAT;
 
@@ -786,7 +797,7 @@ export class DBRequestDS {
 
     // ---- Template (20 bytes) ----
     const tOff = headerLen;
-    let orsBitmap = (ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA) >>> 0;
+    let orsBitmap = (ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA | MSG_TEXT_BITS) >>> 0;
     if (opts.rleRequestCompression) orsBitmap = (orsBitmap | ORSBitmap.REQUEST_RLE_COMPRESSED) >>> 0;
     if (opts.rleReplyCompression) orsBitmap = (orsBitmap | ORSBitmap.REPLY_RLE_COMPRESSED) >>> 0;
     const rpbId = opts.rpbId ?? 0;
@@ -932,7 +943,7 @@ export class DBRequestDS {
       cps.push(buildRawCP(pmCp, opts.parameterMarkerData));
     }
 
-    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA;
+    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA | MSG_TEXT_BITS;
     if (opts.requestOutputData) orsBitmap |= ORSBitmap.RESULT_DATA;
     const template = Buffer.alloc(TEMPLATE_LENGTH);
     writeTemplate(template, 0, {
@@ -1035,7 +1046,7 @@ export class DBRequestDS {
     if (opts.extendedParameterData) cps.push(buildRawCP(CodePoint.EXTENDED_COLUMN_DESCRIPTORS, opts.extendedParameterData));
 
     const template = Buffer.alloc(TEMPLATE_LENGTH);
-    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT | ORSBitmap.SQLCA;
+    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT | ORSBitmap.SQLCA | MSG_TEXT_BITS;
     if (opts.requestResultData !== false) {
       orsBitmap |= ORSBitmap.RESULT_DATA;
     }
@@ -1065,7 +1076,7 @@ export class DBRequestDS {
 
     const template = Buffer.alloc(TEMPLATE_LENGTH);
     writeTemplate(template, 0, {
-      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.RESULT_DATA | ORSBitmap.SQLCA,
+      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.RESULT_DATA | ORSBitmap.SQLCA | MSG_TEXT_BITS,
       rpbId: opts.rpbId,
       paramCount: cps.length,
     });
@@ -1122,7 +1133,7 @@ export class DBRequestDS {
 
     const template = Buffer.alloc(TEMPLATE_LENGTH);
     writeTemplate(template, 0, {
-      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA,
+      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA | MSG_TEXT_BITS,
       rpbId: opts.rpbId,
       paramCount: cps.length,
     });
@@ -1414,7 +1425,7 @@ export class DBRequestDS {
 
     const template = Buffer.alloc(TEMPLATE_LENGTH);
     writeTemplate(template, 0, {
-      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA,
+      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA | MSG_TEXT_BITS,
       rpbId: opts.rpbId,
       paramCount: cps.length,
     });

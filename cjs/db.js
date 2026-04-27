@@ -8307,6 +8307,7 @@ var ORSBitmap = Object.freeze({
   RETURN_RESULT_SET_ATTRIBUTES: 32768
 });
 var DEFAULT_ORS_BITMAP = ORSBitmap.SEND_REPLY_IMMED;
+var MSG_TEXT_BITS = ORSBitmap.MESSAGE_ID | ORSBitmap.FIRST_LEVEL_TEXT | ORSBitmap.SECOND_LEVEL_TEXT;
 var UNICODE_CCSID = 13488;
 function encodeUtf16BE(str) {
   const buf = Buffer.alloc(str.length * 2);
@@ -8491,7 +8492,7 @@ class DBRequestDS {
     ];
     const template = Buffer.alloc(TEMPLATE_LENGTH);
     writeTemplate(template, 0, {
-      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA,
+      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA | MSG_TEXT_BITS,
       rpbId: opts.rpbId ?? 0,
       paramCount: cps.length
     });
@@ -8555,7 +8556,7 @@ class DBRequestDS {
     if (opts.translateIndicator != null)
       cps.push(buildByteCP(CodePoint.TRANSLATE_INDICATOR, opts.translateIndicator));
     const isCall = opts.statementType === 3;
-    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT | ORSBitmap.SQLCA;
+    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT | ORSBitmap.SQLCA | MSG_TEXT_BITS;
     if (!isCall)
       orsBitmap |= ORSBitmap.EXTENDED_COLUMN_DESCRIPTORS;
     if (opts.parameterMarkerFormat === true)
@@ -8589,7 +8590,7 @@ class DBRequestDS {
     buf.writeInt16BE(templateLen, 16);
     buf.writeUInt16BE(RequestID.EXECUTE, 18);
     const tOff = headerLen;
-    let orsBitmap = (ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA) >>> 0;
+    let orsBitmap = (ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA | MSG_TEXT_BITS) >>> 0;
     if (opts.rleRequestCompression)
       orsBitmap = (orsBitmap | ORSBitmap.REQUEST_RLE_COMPRESSED) >>> 0;
     if (opts.rleReplyCompression)
@@ -8660,7 +8661,7 @@ class DBRequestDS {
       const pmCp = opts.pmDescriptorHandle ? CodePoint.EXTENDED_PARAMETER_MARKER_DATA : CodePoint.PARAMETER_MARKER_DATA;
       cps.push(buildRawCP(pmCp, opts.parameterMarkerData));
     }
-    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA;
+    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA | MSG_TEXT_BITS;
     if (opts.requestOutputData)
       orsBitmap |= ORSBitmap.RESULT_DATA;
     const template = Buffer.alloc(TEMPLATE_LENGTH);
@@ -8730,7 +8731,7 @@ class DBRequestDS {
     if (opts.extendedParameterData)
       cps.push(buildRawCP(CodePoint.EXTENDED_COLUMN_DESCRIPTORS, opts.extendedParameterData));
     const template = Buffer.alloc(TEMPLATE_LENGTH);
-    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT | ORSBitmap.SQLCA;
+    let orsBitmap = ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.DATA_FORMAT | ORSBitmap.SQLCA | MSG_TEXT_BITS;
     if (opts.requestResultData !== false) {
       orsBitmap |= ORSBitmap.RESULT_DATA;
     }
@@ -8750,7 +8751,7 @@ class DBRequestDS {
       cps.push(buildShortCP(CodePoint.FETCH_SCROLL_OPTION, opts.scrollOrientation));
     const template = Buffer.alloc(TEMPLATE_LENGTH);
     writeTemplate(template, 0, {
-      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.RESULT_DATA | ORSBitmap.SQLCA,
+      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.RESULT_DATA | ORSBitmap.SQLCA | MSG_TEXT_BITS,
       rpbId: opts.rpbId,
       paramCount: cps.length
     });
@@ -8780,7 +8781,7 @@ class DBRequestDS {
       cps.push(buildByteCP(CodePoint.TRANSLATE_INDICATOR, opts.translateIndicator));
     const template = Buffer.alloc(TEMPLATE_LENGTH);
     writeTemplate(template, 0, {
-      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA,
+      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA | MSG_TEXT_BITS,
       rpbId: opts.rpbId,
       paramCount: cps.length
     });
@@ -8946,7 +8947,7 @@ class DBRequestDS {
       cps.push(buildIntCP(CodePoint.BLOCKING_FACTOR, opts.blockingFactor));
     const template = Buffer.alloc(TEMPLATE_LENGTH);
     writeTemplate(template, 0, {
-      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA,
+      orsBitmap: ORSBitmap.SEND_REPLY_IMMED | ORSBitmap.SQLCA | MSG_TEXT_BITS,
       rpbId: opts.rpbId,
       paramCount: cps.length
     });
@@ -9258,14 +9259,30 @@ function parseOperationReply(buf, opts = {}) {
   } else {
     sqlca = createEmptySQLCA();
   }
+  const msgs = extractErrorMessages(reply.codePoints, serverCCSID);
+  if (sqlca.isError && (msgs.messageId || msgs.firstLevelText)) {
+    const parts = [];
+    if (msgs.messageId)
+      parts.push(`[${msgs.messageId}]`);
+    if (msgs.firstLevelText)
+      parts.push(msgs.firstLevelText);
+    const messageText = parts.join(" ");
+    sqlca = {
+      ...sqlca,
+      messageText,
+      secondLevelText: msgs.secondLevelText || "",
+      messageTokens: sqlca.messageTokens || messageText
+    };
+  }
   if (tmpl.rcClass !== 0 && tmpl.rcClass !== 2 && tmpl.rcReturnCode < 0) {
-    const msgs = extractErrorMessages(reply.codePoints, serverCCSID);
     if (sqlca.isSuccess && !sqlca.isError) {
       sqlca = {
         ...sqlca,
         sqlCode: tmpl.rcReturnCode,
         sqlState: msgs.messageId || `RC${tmpl.rcClass}`,
         messageTokens: msgs.firstLevelText || msgs.secondLevelText || `RC class ${tmpl.rcClass}, return code ${tmpl.rcReturnCode}`,
+        messageText: msgs.firstLevelText || "",
+        secondLevelText: msgs.secondLevelText || "",
         isError: true,
         isSuccess: false
       };
@@ -9296,7 +9313,8 @@ function parseFetchReply(buf, opts = {}) {
 }
 function throwIfError(sqlca, context) {
   if (sqlca.isError) {
-    const msg = context ? `${context}: SQLCODE ${sqlca.sqlCode} SQLSTATE ${sqlca.sqlState} — ${sqlca.messageTokens}` : `SQLCODE ${sqlca.sqlCode} SQLSTATE ${sqlca.sqlState} — ${sqlca.messageTokens}`;
+    const detail = sqlca.messageText || sqlca.messageTokens;
+    const msg = context ? `${context}: SQLCODE ${sqlca.sqlCode} SQLSTATE ${sqlca.sqlState} — ${detail}` : `SQLCODE ${sqlca.sqlCode} SQLSTATE ${sqlca.sqlState} — ${detail}`;
     throw new SqlError(msg, {
       returnCode: sqlca.sqlCode,
       messageId: sqlca.sqlState,
@@ -9304,6 +9322,8 @@ function throwIfError(sqlca, context) {
       requestMetadata: {
         sqlCode: sqlca.sqlCode,
         sqlState: sqlca.sqlState,
+        messageText: sqlca.messageText || "",
+        secondLevelText: sqlca.secondLevelText || "",
         messageTokens: sqlca.messageTokens,
         rowCount: sqlca.rowCount,
         sqlerrd: sqlca.sqlerrd

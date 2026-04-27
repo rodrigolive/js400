@@ -198,6 +198,58 @@ describe('parseOperationReply', () => {
     const reply = parseOperationReply(buf);
     expect(getCodePointData(reply, 0x3812)).toEqual(cpData);
   });
+
+  test('enriches SQLCA with message text from 0x3801/0x3802/0x3803 code points', () => {
+    // Build a reply with SQLCA (in 0x3807) + message code points.
+    // SQLCA: 12-byte header (SQLCAID+SQLCABC) + 124-byte body
+    const sqlcaBody = Buffer.alloc(124, 0);
+    sqlcaBody.writeInt32BE(-803, 0); // SQLCODE -803
+    // SQLSTATE at offset 119: write ASCII "23505"
+    Buffer.from('23505').copy(sqlcaBody, 119);
+    const sqlcaCp = Buffer.alloc(12 + 124, 0);
+    sqlcaBody.copy(sqlcaCp, 12);
+
+    // MESSAGE_ID (0x3801): CCSID(2) + text
+    // Use CCSID 819 (latin1) for easy ASCII encoding
+    const msgIdText = 'SQL0803';
+    const msgIdPayload = Buffer.alloc(2 + msgIdText.length);
+    msgIdPayload.writeUInt16BE(819, 0);
+    Buffer.from(msgIdText, 'latin1').copy(msgIdPayload, 2);
+
+    // FIRST_LEVEL_TEXT (0x3802): CCSID(2) + length(2) + text
+    const firstText = 'Duplicate key value specified.';
+    const firstPayload = Buffer.alloc(4 + firstText.length);
+    firstPayload.writeUInt16BE(819, 0);
+    firstPayload.writeUInt16BE(firstText.length, 2);
+    Buffer.from(firstText, 'latin1').copy(firstPayload, 4);
+
+    // SECOND_LEVEL_TEXT (0x3803): CCSID(2) + length(2) + text
+    const secondText = 'Cause: A unique index exists.';
+    const secondPayload = Buffer.alloc(4 + secondText.length);
+    secondPayload.writeUInt16BE(819, 0);
+    secondPayload.writeUInt16BE(secondText.length, 2);
+    Buffer.from(secondText, 'latin1').copy(secondPayload, 4);
+
+    const template = Buffer.alloc(20, 0); // 20-byte reply template
+    const buf = buildReplyBuf({
+      templateLen: 20,
+      template,
+      codePoints: [
+        buildCP(0x3807, sqlcaCp),
+        buildCP(0x3801, msgIdPayload),
+        buildCP(0x3802, firstPayload),
+        buildCP(0x3803, secondPayload),
+      ],
+    });
+
+    const reply = parseOperationReply(buf);
+    expect(reply.sqlca.sqlCode).toBe(-803);
+    expect(reply.sqlca.isError).toBe(true);
+    expect(reply.sqlca.messageText).toContain('SQL0803');
+    expect(reply.sqlca.messageText).toContain('Duplicate key');
+    expect(reply.sqlca.secondLevelText).toContain('unique index');
+  });
+
 });
 
 describe('parseFetchReply', () => {
@@ -269,6 +321,40 @@ describe('throwIfError', () => {
       expect(e.message).toContain('Close cursor');
       expect(e.message).toContain('-501');
       expect(e.message).toContain('24501');
+    }
+  });
+
+  test('uses messageText over messageTokens when available', () => {
+    const sqlca = {
+      sqlCode: -803, sqlState: '23505', isError: true,
+      messageTokens: 'FSD001_PK GIG4001',
+      messageText: '[SQL0803] Duplicate key value specified.',
+      secondLevelText: 'Cause: A unique index exists.',
+      rowCount: 0, sqlerrd: [0, 0, 0, 0, 0, 0],
+    };
+    try {
+      throwIfError(sqlca, 'Execute batch');
+      expect(true).toBe(false);
+    } catch (e) {
+      expect(e.message).toContain('[SQL0803]');
+      expect(e.message).toContain('Duplicate key');
+      expect(e.message).toContain('Execute batch');
+      expect(e.requestMetadata.messageText).toContain('SQL0803');
+      expect(e.requestMetadata.secondLevelText).toContain('unique index');
+    }
+  });
+
+  test('falls back to messageTokens when messageText is absent', () => {
+    const sqlca = {
+      sqlCode: -204, sqlState: '42704', isError: true,
+      messageTokens: 'MYTABLE', rowCount: 0, sqlerrd: [0, 0, 0, 0, 0, 0],
+    };
+    try {
+      throwIfError(sqlca, 'Execute');
+      expect(true).toBe(false);
+    } catch (e) {
+      expect(e.message).toContain('MYTABLE');
+      expect(e.message).not.toContain('[SQL');
     }
   });
 });

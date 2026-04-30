@@ -533,15 +533,16 @@ export function parseSuperExtendedDataFormat(buf) {
   }
 
   // Parse variable-length names
-  const fixedLengthSize = 48 * numFields;
   for (let i = 0; i < fixedParts.length; i++) {
     const fp = fixedParts[i];
     let name = '';
 
     if (fp.lengthOfVarLen > 0) {
-      const varOff = 16 + (48 * i) + fp.offsetToVarLen - fixedLengthSize + fixedLengthSize;
-      // offsetToVarLen is relative to start of fixed data
-      const actualOff = 16 + fp.offsetToVarLen;
+      // offsetToVarLen is relative to the start of THIS field's fixed
+      // data (at 16 + i*48), NOT the buffer header. See JTOpen
+      // DBSuperExtendedDataFormat.java findCodePoint / getFieldName:
+      //   offset_ + 16 + offsetToVarLen + (fieldIndex * REPEATED_FIXED_LENGTH_)
+      const actualOff = 16 + (i * 48) + fp.offsetToVarLen;
       if (actualOff + 8 <= buf.length) {
         const varFieldLL = buf.readInt32BE(actualOff);
         const varFieldCCSID = buf.readUInt16BE(actualOff + 6);

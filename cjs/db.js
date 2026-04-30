@@ -9882,8 +9882,7 @@ function parseSuperExtendedDataFormat(buf) {
     const fp = fixedParts[i];
     let name = "";
     if (fp.lengthOfVarLen > 0) {
-      const varOff = 16 + 48 * i + fp.offsetToVarLen - fixedLengthSize + fixedLengthSize;
-      const actualOff = 16 + fp.offsetToVarLen;
+      const actualOff = 16 + (i * 48) + fp.offsetToVarLen;
       if (actualOff + 8 <= buf.length) {
         const varFieldLL = buf.readInt32BE(actualOff);
         const varFieldCCSID = buf.readUInt16BE(actualOff + 6);

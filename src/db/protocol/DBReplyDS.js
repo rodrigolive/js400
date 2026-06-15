@@ -53,6 +53,36 @@ const REPLY_CP = {
 };
 
 /**
+ * Fallback human-readable descriptions for common Db2 for i SQLCODEs.
+ * Used when the server reply omits message text code points (0x3801-0x3803).
+ * Sourced from IBM Db2 for i SQL Messages and Codes (SC41-5017).
+ */
+const SQLCODE_FALLBACK_MESSAGES = new Map([
+  [-104, 'Token not valid. Expected tokens may include: <list>'],
+  [-199, 'Keyword not expected. Valid tokens: <list>'],
+  [-204, 'Object not found'],
+  [-206, 'Column or global variable not found'],
+  [-302, 'Input variable or parameter not valid for its use'],
+  [-303, 'Value cannot be assigned to host variable because value is not within range of host variable'],
+  [-304, 'Value not within range of its data type'],
+  [-305, 'Indicator variable required'],
+  [-501, 'Cursor not open'],
+  [-502, 'Cursor already open'],
+  [-503, 'Column cannot be updated because it is not identified in UPDATE clause of cursor'],
+  [-504, 'Cursor name not defined'],
+  [-518, 'Statement cannot be executed; not a prepared statement'],
+  [-530, 'Insert or update value not allowed by referential constraint'],
+  [-532, 'Delete prevented by referential constraint'],
+  [-551, 'Not authorized to object'],
+  [-601, 'Object already exists'],
+  [-803, 'Duplicate key value specified'],
+  [-811, 'Result of SELECT INTO is more than one row'],
+  [-904, 'Resource limit exceeded'],
+  [-952, 'Processing cancelled'],
+  [-7008, 'Object not valid for operation'],
+]);
+
+/**
  * Parse a complete database reply buffer.
  *
  * @param {Buffer} buf - raw reply datastream
@@ -484,6 +514,15 @@ export function parseOperationReply(buf, opts = {}) {
       secondLevelText: msgs.secondLevelText || '',
       messageTokens: sqlca.messageTokens || messageText,
     };
+  } else if (sqlca.isError && !sqlca.messageText && !sqlca.messageTokens) {
+    const fallback = SQLCODE_FALLBACK_MESSAGES.get(sqlca.sqlCode);
+    if (fallback) {
+      sqlca = {
+        ...sqlca,
+        messageText: fallback,
+        messageTokens: sqlca.messageTokens || fallback,
+      };
+    }
   }
 
   // Check reply template for errors.
@@ -553,7 +592,10 @@ export function throwIfError(sqlca, context) {
     // Build the error message JTOpen-style:
     //   "Context: SQLCODE -803 SQLSTATE 23505 — [SQL0803] Duplicate key value specified"
     // Falls back to ERRMC tokens when message text isn't available.
-    const detail = sqlca.messageText || sqlca.messageTokens;
+    const detail = sqlca.messageText
+      || sqlca.messageTokens
+      || SQLCODE_FALLBACK_MESSAGES.get(sqlca.sqlCode)
+      || '';
     const msg = context
       ? `${context}: SQLCODE ${sqlca.sqlCode} SQLSTATE ${sqlca.sqlState} — ${detail}`
       : `SQLCODE ${sqlca.sqlCode} SQLSTATE ${sqlca.sqlState} — ${detail}`;
@@ -607,8 +649,7 @@ function decodeUtf16BE(buf) {
   return chars.join('');
 }
 
-/** Re-export SQLCA_LENGTH for external use. */
-export { SQLCA_LENGTH };
+export { SQLCA_LENGTH, SQLCODE_FALLBACK_MESSAGES };
 
 export class DBReplyDS {
   static parseReply = parseReply;
@@ -622,4 +663,5 @@ export class DBReplyDS {
   static hasCodePoint = hasCodePoint;
   static decodeTextCodePoint = decodeTextCodePoint;
   static SQLCA_LENGTH = SQLCA_LENGTH;
+  static SQLCODE_FALLBACK_MESSAGES = SQLCODE_FALLBACK_MESSAGES;
 }

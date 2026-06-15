@@ -86,5 +86,9 @@ export class SqlError extends AS400Error {
   constructor(message, details) {
     super(message, details);
     this.name = 'SqlError';
+    this.sqlCode = details?.requestMetadata?.sqlCode
+      ?? details?.returnCode ?? null;
+    this.sqlState = details?.requestMetadata?.sqlState
+      ?? details?.messageId ?? null;
   }
 }

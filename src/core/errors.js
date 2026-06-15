@@ -92,3 +92,23 @@ export class SqlError extends AS400Error {
       ?? details?.messageId ?? null;
   }
 }
+
+/**
+ * Batch execution error with per-row update counts.
+ *
+ * Mirrors java.sql.BatchUpdateException: carries the update counts for
+ * rows that succeeded before the error, plus the underlying SqlError.
+ *
+ * @property {number[]} updateCounts - one entry per row in the batch.
+ *   Values: 1 = success (INSERT), -2 = SUCCESS_NO_INFO, -3 = EXECUTE_FAILED.
+ *   The array is always the same length as the original batch.
+ * @property {Array<{row: number, sqlCode: number, sqlState: string, message: string}>} rowErrors
+ */
+export class BatchUpdateError extends SqlError {
+  constructor(message, details) {
+    super(message, details);
+    this.name = 'BatchUpdateError';
+    this.updateCounts = details?.updateCounts ?? [];
+    this.rowErrors = details?.rowErrors ?? [];
+  }
+}

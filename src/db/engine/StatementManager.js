@@ -12,7 +12,9 @@ import { DBRequestDS, DescribeOption, StatementType, OpenAttributes, ORSBitmap }
 import {
   parseOperationReply, parseFetchReply, throwIfError,
   getCodePointData,
+  SQLCODE_FALLBACK_MESSAGES,
 } from '../protocol/DBReplyDS.js';
+import { BatchUpdateError } from '../../core/errors.js';
 import {
   parseColumnDescriptors, parseExtendedColumnDescriptors,
   parseBasicDataFormat, parseSuperExtendedDataFormat,
@@ -930,7 +932,51 @@ export class StatementManager {
         prof.rowCount += chunkRowCount;
       }
       const reply = parseOperationReply(replyBuf, { serverCCSID: this.#serverCCSID });
-      throwIfError(reply.sqlca, 'Execute (batch)');
+
+      if (reply.sqlca.isError) {
+        // Build per-row update counts using SQLERRD[2] (rows affected
+        // before error). Mirrors JTOpen AS400JDBCPreparedStatementImpl.
+        const successfulInChunk = Math.min(
+          Math.max(reply.sqlca.sqlerrd?.[2] ?? 0, 0),
+          chunkRowCount,
+        );
+        const updateCounts = new Array(batchSize);
+        for (let i = 0; i < chunkStart; i++) {
+          updateCounts[i] = isInsert ? 1 : -2;
+        }
+        for (let i = chunkStart; i < chunkStart + successfulInChunk; i++) {
+          updateCounts[i] = isInsert ? 1 : -2;
+        }
+        for (let i = chunkStart + successfulInChunk; i < batchSize; i++) {
+          updateCounts[i] = -3;
+        }
+
+        const sqlca = reply.sqlca;
+        const detail = sqlca.messageText || sqlca.messageTokens
+          || SQLCODE_FALLBACK_MESSAGES.get(sqlca.sqlCode) || '';
+        const msg = `Execute (batch): SQLCODE ${sqlca.sqlCode} SQLSTATE ${sqlca.sqlState} — ${detail}`;
+        throw new BatchUpdateError(msg, {
+          returnCode: sqlca.sqlCode,
+          messageId: sqlca.sqlState,
+          hostService: 'database',
+          requestMetadata: {
+            sqlCode: sqlca.sqlCode,
+            sqlState: sqlca.sqlState,
+            messageText: sqlca.messageText || '',
+            secondLevelText: sqlca.secondLevelText || '',
+            messageTokens: sqlca.messageTokens,
+            rowCount: sqlca.rowCount,
+            sqlerrd: sqlca.sqlerrd,
+          },
+          updateCounts,
+          rowErrors: [{
+            row: chunkStart + successfulInChunk,
+            sqlCode: sqlca.sqlCode,
+            sqlState: sqlca.sqlState,
+            message: detail,
+          }],
+        });
+      }
 
       totalAffected += reply.sqlca.rowCount || 0;
       lastSqlca = reply.sqlca;

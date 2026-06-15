@@ -351,7 +351,7 @@ var init_constants = __esm(() => {
 });
 
 // src/core/errors.js
-var AS400Error, AS400SecurityError, ConnectionDroppedError, DatastreamError, HostMessageError, PcmlError, PrintError, SqlError;
+var AS400Error, AS400SecurityError, ConnectionDroppedError, DatastreamError, HostMessageError, PcmlError, PrintError, SqlError, BatchUpdateError;
 var init_errors = __esm(() => {
   AS400Error = class AS400Error extends Error {
     constructor(message, details = {}) {
@@ -406,6 +406,14 @@ var init_errors = __esm(() => {
       this.name = "SqlError";
       this.sqlCode = details?.requestMetadata?.sqlCode ?? details?.returnCode ?? null;
       this.sqlState = details?.requestMetadata?.sqlState ?? details?.messageId ?? null;
+    }
+  };
+  BatchUpdateError = class BatchUpdateError extends SqlError {
+    constructor(message, details) {
+      super(message, details);
+      this.name = "BatchUpdateError";
+      this.updateCounts = details?.updateCounts ?? [];
+      this.rowErrors = details?.rowErrors ?? [];
     }
   };
 });
@@ -8301,6 +8309,7 @@ __export(exports_src, {
   ConnectionDroppedError: () => ConnectionDroppedError,
   Connection: () => Connection,
   CommandCall: () => CommandCall,
+  BatchUpdateError: () => BatchUpdateError,
   AuthScheme: () => AuthScheme,
   AUTH_BYTES_TYPE: () => AUTH_BYTES_TYPE,
   AS400Text: () => AS400Text,
@@ -15302,6 +15311,9 @@ function normalizeProperties(userProps) {
   return merged;
 }
 
+// src/db/engine/StatementManager.js
+init_errors();
+
 // src/db/protocol/DBDescriptors.js
 init_CharConverter();
 var SqlType = Object.freeze({
@@ -17536,7 +17548,43 @@ class StatementManager {
         prof.rowCount += chunkRowCount;
       }
       const reply = parseOperationReply(replyBuf, { serverCCSID: this.#serverCCSID });
-      throwIfError2(reply.sqlca, "Execute (batch)");
+      if (reply.sqlca.isError) {
+        const successfulInChunk = Math.min(Math.max(reply.sqlca.sqlerrd?.[2] ?? 0, 0), chunkRowCount);
+        const updateCounts = new Array(batchSize);
+        for (let i = 0;i < chunkStart; i++) {
+          updateCounts[i] = isInsert ? 1 : -2;
+        }
+        for (let i = chunkStart;i < chunkStart + successfulInChunk; i++) {
+          updateCounts[i] = isInsert ? 1 : -2;
+        }
+        for (let i = chunkStart + successfulInChunk;i < batchSize; i++) {
+          updateCounts[i] = -3;
+        }
+        const sqlca = reply.sqlca;
+        const detail = sqlca.messageText || sqlca.messageTokens || SQLCODE_FALLBACK_MESSAGES.get(sqlca.sqlCode) || "";
+        const msg = `Execute (batch): SQLCODE ${sqlca.sqlCode} SQLSTATE ${sqlca.sqlState} — ${detail}`;
+        throw new BatchUpdateError(msg, {
+          returnCode: sqlca.sqlCode,
+          messageId: sqlca.sqlState,
+          hostService: "database",
+          requestMetadata: {
+            sqlCode: sqlca.sqlCode,
+            sqlState: sqlca.sqlState,
+            messageText: sqlca.messageText || "",
+            secondLevelText: sqlca.secondLevelText || "",
+            messageTokens: sqlca.messageTokens,
+            rowCount: sqlca.rowCount,
+            sqlerrd: sqlca.sqlerrd
+          },
+          updateCounts,
+          rowErrors: [{
+            row: chunkStart + successfulInChunk,
+            sqlCode: sqlca.sqlCode,
+            sqlState: sqlca.sqlState,
+            message: detail
+          }]
+        });
+      }
       totalAffected += reply.sqlca.rowCount || 0;
       lastSqlca = reply.sqlca;
     }

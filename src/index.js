@@ -24,6 +24,7 @@ export {
   PcmlError,
   PrintError,
   SqlError,
+  BatchUpdateError,
 } from './core/errors.js';
 export { DataStream } from './transport/DataStream.js';
 export { PortMapper } from './transport/PortMapper.js';

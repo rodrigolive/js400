@@ -1,6 +1,6 @@
 {
   "name": "js400",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Pure JavaScript IBM i client library — wire-compatible JTOpen port for Node v20+ and Bun",
   "type": "module",
   "engines": {

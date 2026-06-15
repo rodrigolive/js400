@@ -557,9 +557,10 @@ export class PreparedStatement {
 
     // Application-level chunking: split into smaller atomic batches
     // for better error granularity.
-    const chunkSize = Number.isFinite(safeOpts.chunkSize)
-      ? Math.max(1, Math.trunc(safeOpts.chunkSize))
+    const rawChunk = Number.isFinite(safeOpts.chunkSize)
+      ? Math.trunc(safeOpts.chunkSize)
       : 0;
+    const chunkSize = rawChunk > 0 ? rawChunk : 0;
     if (chunkSize > 0 && batchSize > chunkSize) {
       return this.#executeBatchChunked(paramSets, chunkSize);
     }

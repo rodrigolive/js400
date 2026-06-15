@@ -15512,13 +15512,22 @@ class PreparedStatement {
       }
     };
   }
-  async executeBatch(paramSets) {
+  async executeBatch(paramSets, opts) {
     this.#ensureOpen();
     this.#lastGeneratedKeys = null;
     this.#warnings = null;
     const batchSize = paramSets?.length ?? 0;
     if (batchSize === 0) {
       return { updateCounts: [], totalAffected: 0 };
+    }
+    const safeOpts = opts != null && typeof opts === "object" ? opts : {};
+    if (safeOpts.atomic === false) {
+      return this.#executeBatchNonAtomic(paramSets);
+    }
+    const rawChunk = Number.isFinite(safeOpts.chunkSize) ? Math.trunc(safeOpts.chunkSize) : 0;
+    const chunkSize = rawChunk > 0 ? rawChunk : 0;
+    if (chunkSize > 0 && batchSize > chunkSize) {
+      return this.#executeBatchChunked(paramSets, chunkSize);
     }
     const effectiveSets = batchHasWrappers(paramSets) ? await this.#resolveWrapperSets(paramSets) : paramSets;
     const result = await this.#runWithCancellation(() => this.#dbConnection.statementManager.executeBatch(this.#stmtHandle, effectiveSets));
@@ -15563,6 +15572,85 @@ class PreparedStatement {
     try {
       await this.#dbConnection.statementManager.closeStatement(handle);
     } catch {}
+  }
+  async#executeBatchNonAtomic(paramSets) {
+    const batchSize = paramSets.length;
+    const updateCounts = new Array(batchSize);
+    const rowErrors = [];
+    let totalAffected = 0;
+    for (let i = 0;i < batchSize; i++) {
+      try {
+        const result = await this.execute(paramSets[i]);
+        const affected = Array.isArray(result) ? result.length : result.affectedRows ?? 0;
+        updateCounts[i] = affected;
+        totalAffected += affected;
+      } catch (err) {
+        if (!(err instanceof SqlError))
+          throw err;
+        updateCounts[i] = -3;
+        rowErrors.push({
+          row: i,
+          sqlCode: err.sqlCode ?? err.returnCode ?? null,
+          sqlState: err.sqlState ?? err.messageId ?? null,
+          message: err.message || ""
+        });
+      }
+    }
+    if (rowErrors.length > 0) {
+      const first = rowErrors[0];
+      const msg = `Execute (batch, non-atomic): ${rowErrors.length} of ${batchSize} rows failed. ` + `First error at row ${first.row}: SQLCODE ${first.sqlCode} SQLSTATE ${first.sqlState} — ${first.message}`;
+      throw new BatchUpdateError(msg, {
+        returnCode: first.sqlCode,
+        messageId: first.sqlState,
+        hostService: "database",
+        updateCounts,
+        rowErrors
+      });
+    }
+    return { updateCounts, totalAffected };
+  }
+  async#executeBatchChunked(paramSets, chunkSize) {
+    const batchSize = paramSets.length;
+    const updateCounts = new Array(batchSize);
+    let totalAffected = 0;
+    for (let start = 0;start < batchSize; start += chunkSize) {
+      const end = Math.min(start + chunkSize, batchSize);
+      const chunk = paramSets.slice(start, end);
+      try {
+        const result = await this.executeBatch(chunk);
+        for (let i = 0;i < chunk.length; i++) {
+          updateCounts[start + i] = result.updateCounts[i];
+        }
+        totalAffected += result.totalAffected;
+      } catch (err) {
+        if (err.updateCounts) {
+          for (let i = 0;i < chunk.length; i++) {
+            updateCounts[start + i] = err.updateCounts[i] ?? -3;
+          }
+        } else {
+          for (let i = start;i < end; i++) {
+            updateCounts[i] = -3;
+          }
+        }
+        for (let i = end;i < batchSize; i++) {
+          updateCounts[i] = -3;
+        }
+        const offsetErrors = err.rowErrors ? err.rowErrors.map((e) => ({ ...e, row: e.row + start })) : [{
+          row: start,
+          sqlCode: err.sqlCode ?? err.returnCode ?? null,
+          sqlState: err.sqlState ?? err.messageId ?? null,
+          message: err.message || ""
+        }];
+        throw new BatchUpdateError(err.message, {
+          returnCode: err.returnCode ?? err.sqlCode,
+          messageId: err.messageId ?? err.sqlState,
+          hostService: "database",
+          updateCounts,
+          rowErrors: offsetErrors
+        });
+      }
+    }
+    return { updateCounts, totalAffected };
   }
   #setAt(index, value) {
     const idx = Number(index);

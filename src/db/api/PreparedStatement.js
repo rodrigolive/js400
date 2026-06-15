@@ -13,7 +13,7 @@ import { ResultSet } from './ResultSet.js';
 import { ResultSetMetaData } from './ResultSetMetaData.js';
 import { ParameterMetaData } from './ParameterMetaData.js';
 import { SqlWarning, warningFromSqlca } from './SqlWarning.js';
-import { SqlError } from '../../core/errors.js';
+import { SqlError, BatchUpdateError } from '../../core/errors.js';
 import { SqlArray } from './SqlArray.js';
 import { RowId } from './RowId.js';
 import { Blob } from '../lob/Blob.js';
@@ -528,19 +528,36 @@ export class PreparedStatement {
    * where the total matches the batch size (then 1 per row).
    *
    * @param {any[][]} paramSets
+   * @param {object} [opts]
+   * @param {boolean} [opts.atomic=true] - false = row-by-row execution
+   *   that continues past errors (client-side NOT ATOMIC CONTINUE ON
+   *   SQLEXCEPTION). Significantly slower: N round-trips instead of 1.
+   * @param {number} [opts.chunkSize] - split the batch into chunks of
+   *   this size. Each chunk is a separate atomic blocked insert. If a
+   *   chunk fails, prior chunks' rows are already committed (autocommit
+   *   ON) or pending (autocommit OFF).
    * @returns {Promise<{ updateCounts: number[], totalAffected: number }>}
    */
-  async executeBatch(paramSets) {
+  async executeBatch(paramSets, opts = {}) {
     this.#ensureOpen();
-    // Batch executes do not return generated keys, but JDBC contract
-    // requires getGeneratedKeys() and getWarnings() after any execute
-    // to reflect THIS execute only — never a stale capture from an
-    // earlier call.
     this.#lastGeneratedKeys = null;
     this.#warnings = null;
     const batchSize = paramSets?.length ?? 0;
     if (batchSize === 0) {
       return { updateCounts: [], totalAffected: 0 };
+    }
+
+    // Non-atomic mode: execute row-by-row, catch errors per row.
+    // Mirrors JTOpen's !canBatch fallback (AS400JDBCPreparedStatementImpl:1728).
+    if (opts.atomic === false) {
+      return this.#executeBatchNonAtomic(paramSets);
+    }
+
+    // Application-level chunking: split into smaller atomic batches
+    // for better error granularity.
+    const chunkSize = opts.chunkSize;
+    if (chunkSize && chunkSize > 0 && batchSize > chunkSize) {
+      return this.#executeBatchChunked(paramSets, chunkSize);
     }
 
     // Fast path: the hot bulk-insert case passes only primitives. Avoid
@@ -615,6 +632,90 @@ export class PreparedStatement {
   }
 
   // --- Internal helpers ---
+
+  async #executeBatchNonAtomic(paramSets) {
+    const batchSize = paramSets.length;
+    const updateCounts = new Array(batchSize);
+    const rowErrors = [];
+    let totalAffected = 0;
+
+    for (let i = 0; i < batchSize; i++) {
+      try {
+        const result = await this.execute(paramSets[i]);
+        const affected = Array.isArray(result) ? result.length : (result.affectedRows ?? 0);
+        updateCounts[i] = affected > 0 ? affected : -2;
+        totalAffected += affected > 0 ? affected : 0;
+      } catch (err) {
+        updateCounts[i] = -3;
+        rowErrors.push({
+          row: i,
+          sqlCode: err.sqlCode ?? err.returnCode ?? null,
+          sqlState: err.sqlState ?? err.messageId ?? null,
+          message: err.message || '',
+        });
+      }
+    }
+
+    if (rowErrors.length > 0) {
+      const first = rowErrors[0];
+      const msg = `Execute (batch, non-atomic): ${rowErrors.length} of ${batchSize} rows failed. `
+        + `First error at row ${first.row}: SQLCODE ${first.sqlCode} SQLSTATE ${first.sqlState} — ${first.message}`;
+      throw new BatchUpdateError(msg, {
+        returnCode: first.sqlCode,
+        messageId: first.sqlState,
+        hostService: 'database',
+        updateCounts,
+        rowErrors,
+      });
+    }
+
+    return { updateCounts, totalAffected };
+  }
+
+  async #executeBatchChunked(paramSets, chunkSize) {
+    const batchSize = paramSets.length;
+    const updateCounts = new Array(batchSize);
+    let totalAffected = 0;
+
+    for (let start = 0; start < batchSize; start += chunkSize) {
+      const end = Math.min(start + chunkSize, batchSize);
+      const chunk = paramSets.slice(start, end);
+      try {
+        const result = await this.executeBatch(chunk);
+        for (let i = 0; i < chunk.length; i++) {
+          updateCounts[start + i] = result.updateCounts[i];
+        }
+        totalAffected += result.totalAffected;
+      } catch (err) {
+        if (err.updateCounts) {
+          for (let i = 0; i < chunk.length; i++) {
+            updateCounts[start + i] = err.updateCounts[i] ?? -3;
+          }
+        } else {
+          for (let i = start; i < end; i++) {
+            updateCounts[i] = -3;
+          }
+        }
+        for (let i = end; i < batchSize; i++) {
+          updateCounts[i] = -3;
+        }
+        throw new BatchUpdateError(err.message, {
+          returnCode: err.returnCode ?? err.sqlCode,
+          messageId: err.messageId ?? err.sqlState,
+          hostService: 'database',
+          updateCounts,
+          rowErrors: err.rowErrors ?? [{
+            row: start,
+            sqlCode: err.sqlCode ?? err.returnCode ?? null,
+            sqlState: err.sqlState ?? err.messageId ?? null,
+            message: err.message || '',
+          }],
+        });
+      }
+    }
+
+    return { updateCounts, totalAffected };
+  }
 
   #setAt(index, value) {
     const idx = Number(index);

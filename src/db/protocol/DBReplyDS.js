@@ -80,6 +80,8 @@ const SQLCODE_FALLBACK_MESSAGES = new Map([
   [-904, 'Resource limit exceeded'],
   [-952, 'Processing cancelled'],
   [-7008, 'Object not valid for operation'],
+  [-7061, 'Object cannot be journaled'],
+  [-9010, 'Journal operation failed'],
 ]);
 
 /**

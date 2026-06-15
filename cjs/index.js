@@ -404,6 +404,8 @@ var init_errors = __esm(() => {
     constructor(message, details) {
       super(message, details);
       this.name = "SqlError";
+      this.sqlCode = details?.requestMetadata?.sqlCode ?? details?.returnCode ?? null;
+      this.sqlState = details?.requestMetadata?.sqlState ?? details?.messageId ?? null;
     }
   };
 });
@@ -14739,6 +14741,30 @@ var REPLY_CP = {
   RLE_COMPRESSED: 14386,
   DATASTREAM_LEVEL: 14849
 };
+var SQLCODE_FALLBACK_MESSAGES = new Map([
+  [-104, "Token not valid. Expected tokens may include: <list>"],
+  [-199, "Keyword not expected. Valid tokens: <list>"],
+  [-204, "Object not found"],
+  [-206, "Column or global variable not found"],
+  [-302, "Input variable or parameter not valid for its use"],
+  [-303, "Value cannot be assigned to host variable because value is not within range of host variable"],
+  [-304, "Value not within range of its data type"],
+  [-305, "Indicator variable required"],
+  [-501, "Cursor not open"],
+  [-502, "Cursor already open"],
+  [-503, "Column cannot be updated because it is not identified in UPDATE clause of cursor"],
+  [-504, "Cursor name not defined"],
+  [-518, "Statement cannot be executed; not a prepared statement"],
+  [-530, "Insert or update value not allowed by referential constraint"],
+  [-532, "Delete prevented by referential constraint"],
+  [-551, "Not authorized to object"],
+  [-601, "Object already exists"],
+  [-803, "Duplicate key value specified"],
+  [-811, "Result of SELECT INTO is more than one row"],
+  [-904, "Resource limit exceeded"],
+  [-952, "Processing cancelled"],
+  [-7008, "Object not valid for operation"]
+]);
 function parseReply(buf) {
   if (!buf || buf.length < DataStream.HEADER_LENGTH) {
     throw new DatastreamError("Database reply too short", { bufferOffsets: { start: 0, end: buf?.length ?? 0 } });
@@ -15011,6 +15037,15 @@ function parseOperationReply(buf, opts = {}) {
       secondLevelText: msgs.secondLevelText || "",
       messageTokens: sqlca.messageTokens || messageText
     };
+  } else if (sqlca.isError && !sqlca.messageText && !sqlca.messageTokens) {
+    const fallback = SQLCODE_FALLBACK_MESSAGES.get(sqlca.sqlCode);
+    if (fallback) {
+      sqlca = {
+        ...sqlca,
+        messageText: fallback,
+        messageTokens: sqlca.messageTokens || fallback
+      };
+    }
   }
   if (tmpl.rcClass !== 0 && tmpl.rcClass !== 2 && tmpl.rcReturnCode < 0) {
     if (sqlca.isSuccess && !sqlca.isError) {
@@ -15051,7 +15086,7 @@ function parseFetchReply(buf, opts = {}) {
 }
 function throwIfError2(sqlca, context) {
   if (sqlca.isError) {
-    const detail = sqlca.messageText || sqlca.messageTokens;
+    const detail = sqlca.messageText || sqlca.messageTokens || SQLCODE_FALLBACK_MESSAGES.get(sqlca.sqlCode) || "";
     const msg = context ? `${context}: SQLCODE ${sqlca.sqlCode} SQLSTATE ${sqlca.sqlState} — ${detail}` : `SQLCODE ${sqlca.sqlCode} SQLSTATE ${sqlca.sqlState} — ${detail}`;
     throw new SqlError(msg, {
       returnCode: sqlca.sqlCode,
@@ -15615,12 +15650,11 @@ function parseSuperExtendedDataFormat(buf) {
       lengthOfVarLen: buf.readInt32BE(off + 36)
     });
   }
-  const fixedLengthSize = 48 * numFields;
   for (let i = 0;i < fixedParts.length; i++) {
     const fp = fixedParts[i];
     let name = "";
     if (fp.lengthOfVarLen > 0) {
-      const actualOff = 16 + (i * 48) + fp.offsetToVarLen;
+      const actualOff = 16 + i * 48 + fp.offsetToVarLen;
       if (actualOff + 8 <= buf.length) {
         const varFieldLL = buf.readInt32BE(actualOff);
         const varFieldCCSID = buf.readUInt16BE(actualOff + 6);

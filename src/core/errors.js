@@ -103,6 +103,8 @@ export class SqlError extends AS400Error {
  *   Values: 1 = success (INSERT), -2 = SUCCESS_NO_INFO, -3 = EXECUTE_FAILED.
  *   The array is always the same length as the original batch.
  * @property {Array<{row: number, sqlCode: number, sqlState: string, message: string}>} rowErrors
+ *   Currently contains exactly one entry: the first error that aborted the
+ *   batch. The array type allows future multi-error diagnostics support.
  */
 export class BatchUpdateError extends SqlError {
   constructor(message, details) {

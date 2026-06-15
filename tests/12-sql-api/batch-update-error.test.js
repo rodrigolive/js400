@@ -13,24 +13,6 @@ import { PreparedStatement } from '../../src/db/api/PreparedStatement.js';
 
 // ---- SQLCA shapes captured from live PUB400 batch errors ----
 
-function makeBatchErrorSqlca(overrides = {}) {
-  return {
-    sqlCode: -803,
-    sqlState: '23505',
-    messageTokens: '\x00\x02*N\x00\x02*N\x00ZBATCH01\x00GIG4002',
-    messageText: '[SQL0803] Duplicate key value specified.',
-    secondLevelText: 'Cause: duplicate key in unique index',
-    productId: 'QSQ07020',
-    sqlerrd: [-168758284, -168759047, 2, 0, 0, 0],
-    sqlwarn: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    rowCount: 2,
-    isError: true,
-    isWarning: false,
-    isSuccess: false,
-    ...overrides,
-  };
-}
-
 function makeSuccessSqlca(rowCount = 3) {
   return {
     sqlCode: 0,

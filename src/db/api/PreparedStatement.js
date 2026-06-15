@@ -538,7 +538,7 @@ export class PreparedStatement {
    *   ON) or pending (autocommit OFF).
    * @returns {Promise<{ updateCounts: number[], totalAffected: number }>}
    */
-  async executeBatch(paramSets, opts = {}) {
+  async executeBatch(paramSets, opts) {
     this.#ensureOpen();
     this.#lastGeneratedKeys = null;
     this.#warnings = null;
@@ -547,16 +547,20 @@ export class PreparedStatement {
       return { updateCounts: [], totalAffected: 0 };
     }
 
+    const safeOpts = (opts != null && typeof opts === 'object') ? opts : {};
+
     // Non-atomic mode: execute row-by-row, catch errors per row.
     // Mirrors JTOpen's !canBatch fallback (AS400JDBCPreparedStatementImpl:1728).
-    if (opts.atomic === false) {
+    if (safeOpts.atomic === false) {
       return this.#executeBatchNonAtomic(paramSets);
     }
 
     // Application-level chunking: split into smaller atomic batches
     // for better error granularity.
-    const chunkSize = opts.chunkSize;
-    if (chunkSize && chunkSize > 0 && batchSize > chunkSize) {
+    const chunkSize = Number.isFinite(safeOpts.chunkSize)
+      ? Math.max(1, Math.trunc(safeOpts.chunkSize))
+      : 0;
+    if (chunkSize > 0 && batchSize > chunkSize) {
       return this.#executeBatchChunked(paramSets, chunkSize);
     }
 
@@ -643,9 +647,10 @@ export class PreparedStatement {
       try {
         const result = await this.execute(paramSets[i]);
         const affected = Array.isArray(result) ? result.length : (result.affectedRows ?? 0);
-        updateCounts[i] = affected > 0 ? affected : -2;
-        totalAffected += affected > 0 ? affected : 0;
+        updateCounts[i] = affected;
+        totalAffected += affected;
       } catch (err) {
+        if (!(err instanceof SqlError)) throw err;
         updateCounts[i] = -3;
         rowErrors.push({
           row: i,
@@ -699,17 +704,20 @@ export class PreparedStatement {
         for (let i = end; i < batchSize; i++) {
           updateCounts[i] = -3;
         }
+        const offsetErrors = err.rowErrors
+          ? err.rowErrors.map(e => ({ ...e, row: e.row + start }))
+          : [{
+            row: start,
+            sqlCode: err.sqlCode ?? err.returnCode ?? null,
+            sqlState: err.sqlState ?? err.messageId ?? null,
+            message: err.message || '',
+          }];
         throw new BatchUpdateError(err.message, {
           returnCode: err.returnCode ?? err.sqlCode,
           messageId: err.messageId ?? err.sqlState,
           hostService: 'database',
           updateCounts,
-          rowErrors: err.rowErrors ?? [{
-            row: start,
-            sqlCode: err.sqlCode ?? err.returnCode ?? null,
-            sqlState: err.sqlState ?? err.messageId ?? null,
-            message: err.message || '',
-          }],
+          rowErrors: offsetErrors,
         });
       }
     }

@@ -95,7 +95,7 @@ export class PreparedStatement {
   setFetchSize(rows: number): this;
   execute(params?: unknown[], opts?: Record<string, unknown>): Promise<QueryResult[]>;
   executeForStream(params?: unknown[]): Promise<ResultSet>;
-  executeBatch(paramSets: unknown[][]): Promise<BatchResult>;
+  executeBatch(paramSets: unknown[][], opts?: { atomic?: boolean; chunkSize?: number }): Promise<BatchResult>;
   addBatch(params: unknown[]): void;
   clearBatch(): void;
   close(): Promise<void>;

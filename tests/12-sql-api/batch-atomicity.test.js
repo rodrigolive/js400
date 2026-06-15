@@ -5,6 +5,7 @@
  *   - atomic=false (non-atomic, row-by-row execution)
  *   - chunkSize option (application-level chunking)
  *   - backward compatibility (no opts = default atomic)
+ *   - edge cases (opts validation, non-SQL error propagation)
  */
 import { describe, test, expect } from 'bun:test';
 import { SqlError, BatchUpdateError } from '../../src/core/errors.js';
@@ -99,25 +100,17 @@ describe('executeBatch({ atomic: false })', () => {
     expect(result.totalAffected).toBe(3);
   });
 
-  test('continues past errors and collects per-row results', async () => {
+  test('continues past SqlError and collects per-row results', async () => {
     const failRows = new Set([1, 3]);
-    const mock = createMockDbConnection({
-      execute: async (handle, params) => {
-        // params is the row's parameter array; use the first value
-        // to identify the row. We track via call index instead.
-        throw new Error('will be overridden');
-      },
-    });
-
     let callIdx = 0;
+    const mock = createMockDbConnection();
     mock.db.statementManager.execute = async () => {
       const idx = callIdx++;
       if (failRows.has(idx)) {
-        const err = new SqlError('Duplicate key', {
+        throw new SqlError('Duplicate key', {
           returnCode: -803,
           messageId: '23505',
         });
-        throw err;
       }
       return {
         hasResultSet: false,
@@ -143,6 +136,49 @@ describe('executeBatch({ atomic: false })', () => {
       expect(err.rowErrors[0].sqlCode).toBe(-803);
       expect(err.rowErrors[1].row).toBe(3);
     }
+  });
+
+  test('non-SqlError is thrown immediately, stops execution', async () => {
+    let callIdx = 0;
+    const mock = createMockDbConnection();
+    mock.db.statementManager.execute = async () => {
+      const idx = callIdx++;
+      if (idx === 1) throw new TypeError('connection lost');
+      return {
+        hasResultSet: false, rows: [], affectedRows: 1,
+        sqlca: makeSuccessSqlca(1), rpbId: 1, endOfData: true,
+        columnDescriptors: [],
+      };
+    };
+
+    const pstmt = makePreparedStatement(mock);
+    try {
+      await pstmt.executeBatch([[1], [2], [3]], { atomic: false });
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(TypeError);
+      expect(err.message).toBe('connection lost');
+      // Only 2 rows attempted (row 0 ok, row 1 threw, row 2 never reached)
+      expect(callIdx).toBe(2);
+    }
+  });
+
+  test('preserves zero affected count (not SUCCESS_NO_INFO)', async () => {
+    const mock = createMockDbConnection({
+      execute: async () => ({
+        hasResultSet: false,
+        rows: [],
+        affectedRows: 0,
+        sqlca: makeSuccessSqlca(0),
+        rpbId: 1,
+        endOfData: true,
+        columnDescriptors: [],
+      }),
+    });
+    const pstmt = makePreparedStatement(mock);
+    const result = await pstmt.executeBatch([[1], [2]], { atomic: false });
+    expect(result.updateCounts).toEqual([0, 0]);
+    expect(result.totalAffected).toBe(0);
   });
 
   test('all rows succeed returns normal result (no error thrown)', async () => {
@@ -250,7 +286,7 @@ describe('executeBatch({ chunkSize })', () => {
     expect(result.totalAffected).toBe(2500);
   });
 
-  test('error in middle chunk marks prior chunks as succeeded', async () => {
+  test('error in middle chunk: rowErrors offset to batch-level index', async () => {
     let chunkIdx = 0;
     const mock = createMockDbConnection({
       executeBatch: async (handle, paramSets) => {
@@ -288,10 +324,13 @@ describe('executeBatch({ chunkSize })', () => {
       expect(err.updateCounts[200]).toBe(1);
       expect(err.updateCounts[201]).toBe(1);
       expect(err.updateCounts[202]).toBe(-3);
-      // Remaining rows in chunk 2 and all subsequent chunks: failed
+      // Remaining rows: failed
       for (let i = 203; i < 500; i++) {
         expect(err.updateCounts[i]).toBe(-3);
       }
+      // rowErrors[0].row is batch-level, not chunk-local
+      expect(err.rowErrors[0].row).toBe(202);
+      expect(err.rowErrors[0].sqlCode).toBe(-803);
     }
   });
 
@@ -348,6 +387,62 @@ describe('executeBatch option precedence', () => {
     expect(executeCount).toBe(3);
     expect(batchCount).toBe(0);
     expect(result.updateCounts).toEqual([1, 1, 1]);
+  });
+});
+
+// ---- opts validation ----
+
+describe('executeBatch opts validation', () => {
+  test('opts=null does not throw', async () => {
+    const mock = createMockDbConnection({
+      executeBatch: async (handle, paramSets) => ({
+        affectedRows: 2,
+        sqlca: makeSuccessSqlca(2),
+        batchSize: 2,
+        isInsert: true,
+      }),
+    });
+    const pstmt = makePreparedStatement(mock);
+    const result = await pstmt.executeBatch([[1], [2]], null);
+    expect(result.updateCounts).toEqual([1, 1]);
+  });
+
+  test('fractional chunkSize is truncated to integer', async () => {
+    const chunkSizes = [];
+    const mock = createMockDbConnection({
+      executeBatch: async (handle, paramSets) => {
+        chunkSizes.push(paramSets.length);
+        return {
+          affectedRows: paramSets.length,
+          sqlca: makeSuccessSqlca(paramSets.length),
+          batchSize: paramSets.length,
+          isInsert: true,
+        };
+      },
+    });
+    const pstmt = makePreparedStatement(mock);
+    const rows = Array.from({ length: 10 }, (_, i) => [i]);
+    await pstmt.executeBatch(rows, { chunkSize: 3.7 });
+    // 3.7 truncated to 3
+    expect(chunkSizes).toEqual([3, 3, 3, 1]);
+  });
+
+  test('chunkSize=0 is ignored (uses atomic path)', async () => {
+    let batchCalled = false;
+    const mock = createMockDbConnection({
+      executeBatch: async (handle, paramSets) => {
+        batchCalled = true;
+        return {
+          affectedRows: paramSets.length,
+          sqlca: makeSuccessSqlca(paramSets.length),
+          batchSize: paramSets.length,
+          isInsert: true,
+        };
+      },
+    });
+    const pstmt = makePreparedStatement(mock);
+    await pstmt.executeBatch([[1], [2]], { chunkSize: 0 });
+    expect(batchCalled).toBe(true);
   });
 });
 

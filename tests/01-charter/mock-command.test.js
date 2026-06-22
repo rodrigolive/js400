@@ -6,7 +6,7 @@
 import { describe, test, expect, afterEach } from 'bun:test';
 import { createConnection } from 'node:net';
 import { createMockCommandServer } from '../mocks/command-server.js';
-import { DataStream } from '../../src/transport/datastream.js';
+import { DataStream } from '../../src/transport/DataStream.js';
 import { CommandReq } from '../../src/command/protocol/CommandReq.js';
 
 let server;

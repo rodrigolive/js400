@@ -6,7 +6,7 @@
 import { describe, test, expect, afterEach } from 'bun:test';
 import { createConnection } from 'node:net';
 import { createMockSignonServer } from '../mocks/signon-server.js';
-import { DataStream } from '../../src/transport/datastream.js';
+import { DataStream } from '../../src/transport/DataStream.js';
 import { SignonExchangeReq } from '../../src/auth/protocol/SignonExchangeReq.js';
 import { SignonExchangeRep } from '../../src/auth/protocol/SignonExchangeRep.js';
 import { ServerID } from '../../src/core/constants.js';

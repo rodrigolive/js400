@@ -23,6 +23,7 @@ import { TransactionManager, Savepoint } from './TransactionManager.js';
 import { LibraryList } from './LibraryList.js';
 import { SortSequence } from './SortSequence.js';
 import { PackageManager, deriveSuffixContext, isolationToCommitMode } from './PackageManager.js';
+import { normalizeBigintMode } from '../types/int64.js';
 
 const DB_STATE = Symbol.for('js400.dbState');
 
@@ -192,6 +193,12 @@ export class DbConnection {
     // callers see zero behavior change when the knob is off.
     const managerOpts = {
       serverCCSID: this.#serverCCSID,
+      // BIGINT/int64 representation policy. Unlike the opt-in knobs below
+      // (read from #userOpts so they stay null-when-unset), bigintMode has a
+      // real default ('auto'), so it reads from the normalized #properties bag
+      // and must flow even when the caller never set it. Clamped here because
+      // validateProperties is not invoked on the connect path.
+      bigintMode: normalizeBigintMode(this.#properties.bigintMode),
       holdIndicator: this.#explicitHoldIndicator(this.#userOpts),
       // Performance knobs in plumbing-only state per boss's
       // first-pass rule: surfaced on the engine for counter

@@ -90,15 +90,50 @@ describe('INTEGER (496)', () => {
 describe('BIGINT (492)', () => {
   const handler = numericTypes[492];
 
-  test('decode', () => {
+  test('decode narrows to Number at the safe boundary (auto default)', () => {
     const buf = Buffer.alloc(8);
-    buf.writeBigInt64BE(9007199254740991n, 0);
-    expect(handler.decode(buf, 0, { length: 8 }).value).toBe(9007199254740991n);
+    buf.writeBigInt64BE(9007199254740991n, 0); // 2^53 - 1
+    const v = handler.decode(buf, 0, { length: 8 }).value;
+    expect(typeof v).toBe('number');
+    expect(v).toBe(9007199254740991);
+  });
+
+  test('decode keeps BigInt beyond the safe range (auto default)', () => {
+    const buf = Buffer.alloc(8);
+    buf.writeBigInt64BE(9007199254740993n, 0); // 2^53 + 1
+    const v = handler.decode(buf, 0, { length: 8 }).value;
+    expect(typeof v).toBe('bigint');
+    expect(v).toBe(9007199254740993n);
+  });
+
+  test('decode honors bigintMode option', () => {
+    const buf = Buffer.alloc(8);
+    buf.writeBigInt64BE(42n, 0);
+    expect(handler.decode(buf, 0, { length: 8 }, 37, { bigintMode: 'bigint' }).value).toBe(42n);
+    expect(handler.decode(buf, 0, { length: 8 }, 37, { bigintMode: 'number' }).value).toBe(42);
+    expect(handler.decode(buf, 0, { length: 8 }, 37, { bigintMode: 'string' }).value).toBe('42');
+    // 'number' mode is lossy beyond 2^53 but never throws
+    buf.writeBigInt64BE(9007199254740993n, 0);
+    expect(typeof handler.decode(buf, 0, { length: 8 }, 37, { bigintMode: 'number' }).value).toBe('number');
   });
 
   test('encode', () => {
     const buf = handler.encode(12345678901234n, { length: 8 });
     expect(buf.readBigInt64BE(0)).toBe(12345678901234n);
+  });
+
+  test('factory threads bigintMode through decodeValue/decodeRow', () => {
+    const buf = Buffer.alloc(8);
+    buf.writeBigInt64BE(42n, 0);
+    const desc = { sqlType: 492, length: 8, nullable: false, name: 'C', index: 0 };
+
+    // Default (no opts) → auto narrows to Number
+    expect(decodeValue(buf, 0, desc).value).toBe(42);
+    // Forced bigint mode flows down to the decoder
+    expect(decodeValue(buf, 0, desc, 37, { bigintMode: 'bigint' }).value).toBe(42n);
+
+    const { row } = decodeRow(buf, 0, [desc], 37, { bigintMode: 'string' });
+    expect(row.C).toBe('42');
   });
 });
 

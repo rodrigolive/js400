@@ -207,6 +207,7 @@ function generateCursorName(rpbId) {
 export class StatementManager {
   #connection;
   #serverCCSID;
+  #bigintMode;
   #cursorManager;
   #statements;
   #packageManager;
@@ -214,6 +215,7 @@ export class StatementManager {
   constructor(connection, cursorManager, opts = {}) {
     this.#connection = connection;
     this.#serverCCSID = opts.serverCCSID ?? 37;
+    this.#bigintMode = opts.bigintMode ?? 'auto';
     this.#cursorManager = cursorManager;
     this.#statements = new Map();
     // PackageManager is a null reference until DbConnection wires one
@@ -606,7 +608,7 @@ export class StatementManager {
       // can reuse the same decode logic.
       const rows = [];
       for (const dataBuf of reply.rowDataBuffers) {
-        const decoded = decodeResultData(dataBuf, openColumnDescriptors, this.#serverCCSID);
+        const decoded = decodeResultData(dataBuf, openColumnDescriptors, this.#serverCCSID, { bigintMode: this.#bigintMode });
         rows.push(...decoded);
       }
 
@@ -659,6 +661,7 @@ export class StatementManager {
       if (reply.rowDataBuffers.length > 0) {
         const decoded = decodeResultData(
           reply.rowDataBuffers[0], activeParamDescriptors, this.#serverCCSID,
+          { bigintMode: this.#bigintMode },
         );
         if (decoded.length > 0) parameterRow = decoded[0];
       }
@@ -708,7 +711,7 @@ export class StatementManager {
           // (best effort — better than losing rows).
           let descriptors = decodedFormats[i] || decodedFormats[0] || null;
           if (descriptors && descriptors.length > 0) {
-            const rows = decodeResultData(buf, descriptors, this.#serverCCSID);
+            const rows = decodeResultData(buf, descriptors, this.#serverCCSID, { bigintMode: this.#bigintMode });
             resultSetGroups.push({ rows, descriptors });
           } else {
             tailExtras.push(buf);

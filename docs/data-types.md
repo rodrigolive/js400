@@ -47,17 +47,40 @@ const str = varchar.fromBuffer(buf, 0);
 | --- | --- | --- | --- |
 | `AS400Bin2` | 2 bytes | `number` | -32768 to 32767 |
 | `AS400Bin4` | 4 bytes | `number` | -2^31 to 2^31-1 |
-| `AS400Bin8` | 8 bytes | `bigint` | -2^63 to 2^63-1 |
+| `AS400Bin8` | 8 bytes | `number \| bigint` | -2^63 to 2^63-1 |
 | `AS400UnsignedBin1` | 1 byte | `number` | 0 to 255 |
 | `AS400UnsignedBin2` | 2 bytes | `number` | 0 to 65535 |
 | `AS400UnsignedBin4` | 4 bytes | `number` | 0 to 2^32-1 |
-| `AS400UnsignedBin8` | 8 bytes | `bigint` | 0 to 2^64-1 |
+| `AS400UnsignedBin8` | 8 bytes | `number \| bigint` | 0 to 2^64-1 |
 
 ```js
 const bin4 = new AS400Bin4();
 const buf = bin4.toBuffer(42);
 const val = bin4.fromBuffer(buf, 0); // 42
 console.log(bin4.byteLength());       // 4
+```
+
+### 64-bit integers (`AS400Bin8` / `AS400UnsignedBin8`)
+
+By default these return a `number` when the value fits a JS safe integer
+(`|value| <= 2^53-1`) and a `bigint` only when keeping a `number` would lose
+precision. This keeps the common case `JSON.stringify`- and BSON-safe while
+never silently corrupting a large value. Pass a constructor option to force a
+single representation:
+
+```js
+new AS400Bin8();                   // 'auto' (default): number when safe, else bigint
+new AS400Bin8({ bigint: 'number' }); // always number (lossy beyond 2^53-1)
+new AS400Bin8({ bigint: 'bigint' }); // always native BigInt (full precision)
+new AS400Bin8({ bigint: 'string' }); // always a decimal string
+```
+
+The same policy applies to DB2 `BIGINT` columns returned by SQL queries; set it
+per connection with the `bigintMode` option (`'auto'` | `'number'` | `'bigint'`
+| `'string'`):
+
+```js
+const conn = await sql.connect({ host, user, password, bigintMode: 'auto' });
 ```
 
 ## Floating point types

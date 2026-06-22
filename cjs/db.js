@@ -3623,6 +3623,30 @@ var init_CharConverter = __esm(() => {
   };
 });
 
+// src/db/types/int64.js
+function coerceInt64(raw, mode) {
+  switch (mode) {
+    case "bigint":
+      return raw;
+    case "number":
+      return Number(raw);
+    case "string":
+      return raw.toString();
+    case "auto":
+    default: {
+      const n = Number(raw);
+      return raw === BigInt(n) ? n : raw;
+    }
+  }
+}
+function normalizeBigintMode(mode) {
+  return BIGINT_MODES.has(mode) ? mode : "auto";
+}
+var BIGINT_MODES;
+var init_int64 = __esm(() => {
+  BIGINT_MODES = new Set(["auto", "number", "bigint", "string"]);
+});
+
 // src/transport/PortMapper.js
 class PortMapper {
   static async resolvePort(host, serviceId, opts = {}) {
@@ -7104,7 +7128,12 @@ var init_AS400Bin4 = __esm(() => {
 // src/datatypes/AS400Bin8.js
 var AS400Bin8;
 var init_AS400Bin8 = __esm(() => {
+  init_int64();
   AS400Bin8 = class AS400Bin8 extends AS400DataType {
+    constructor(opts = {}) {
+      super();
+      this.mode = normalizeBigintMode(opts.bigint);
+    }
     get typeId() {
       return TYPE_BIN8;
     }
@@ -7117,7 +7146,7 @@ var init_AS400Bin8 = __esm(() => {
       return buf;
     }
     fromBuffer(buf, offset = 0) {
-      return buf.readBigInt64BE(offset);
+      return coerceInt64(buf.readBigInt64BE(offset), this.mode);
     }
   };
 });
@@ -9397,6 +9426,7 @@ function decodeUtf16BE(buf) {
 }
 
 // src/db/properties.js
+init_int64();
 var Naming = Object.freeze({
   SQL: "sql",
   SYSTEM: "system"
@@ -9477,7 +9507,8 @@ var defaultProperties = Object.freeze({
   prefetch: true,
   lazyClose: false,
   translateBinary: false,
-  trueAutoCommit: false
+  trueAutoCommit: false,
+  bigintMode: "auto"
 });
 var KNOWN_PROPERTIES = new Set([
   "naming",
@@ -9513,7 +9544,8 @@ var KNOWN_PROPERTIES = new Set([
   "packageError",
   "translateHex",
   "holdStatements",
-  "blockCriteria"
+  "blockCriteria",
+  "bigintMode"
 ]);
 var VALID_NAMING = new Set(["sql", "system"]);
 var VALID_DATE_FORMATS = new Set(["*ISO", "*USA", "*EUR", "*JIS", "*MDY", "*DMY", "*YMD", "*JUL"]);
@@ -9556,6 +9588,9 @@ function validateProperties(props) {
   }
   if (props.packageError !== undefined && !VALID_PACKAGE_ERROR.has(String(props.packageError).toLowerCase())) {
     throw new Error(`Invalid packageError: "${props.packageError}". Expected one of: ${[...VALID_PACKAGE_ERROR].join(", ")}`);
+  }
+  if (props.bigintMode !== undefined && !BIGINT_MODES.has(props.bigintMode)) {
+    throw new Error(`Invalid bigintMode: "${props.bigintMode}". Expected one of: ${[...BIGINT_MODES].join(", ")}`);
   }
   return warnings;
 }
@@ -10059,6 +10094,7 @@ function decodeUtf16BE3(buf) {
 }
 
 // src/db/types/numeric.js
+init_int64();
 function decodeSmallint(buf, offset, desc) {
   return { value: buf.readInt16BE(offset), bytesRead: 2 };
 }
@@ -10083,8 +10119,9 @@ function encodeIntegerInto(value, buf, offset, fieldLen) {
   buf.writeInt32BE(Number(value) | 0, offset);
   return 4;
 }
-function decodeBigint(buf, offset, desc) {
-  return { value: buf.readBigInt64BE(offset), bytesRead: 8 };
+function decodeBigint(buf, offset, desc, serverCCSID, opts) {
+  const raw = buf.readBigInt64BE(offset);
+  return { value: coerceInt64(raw, opts && opts.bigintMode), bytesRead: 8 };
 }
 function encodeBigint(value, desc) {
   const b = Buffer.alloc(8);
@@ -11017,12 +11054,12 @@ function getTypeHandler(sqlType) {
   }
   return allTypes.get(sqlType & 65534) ?? null;
 }
-function decodeValue(buf, offset, descriptor, serverCCSID = 37) {
+function decodeValue(buf, offset, descriptor, serverCCSID = 37, opts) {
   const handler = getTypeHandler(descriptor.sqlType);
   if (!handler) {
     return { value: null, bytesRead: descriptor.length || 0 };
   }
-  return handler.decode(buf, offset, descriptor, serverCCSID);
+  return handler.decode(buf, offset, descriptor, serverCCSID, opts);
 }
 function encodeValue(value, descriptor, serverCCSID = 37) {
   const handler = getTypeHandler(descriptor.sqlType);
@@ -11046,7 +11083,7 @@ function encodeValueInto(value, buf, offset, fieldLen, descriptor, serverCCSID =
     buf.fill(0, offset + n, offset + fieldLen);
   return fieldLen;
 }
-function decodeRow(buf, startOffset, descriptors, serverCCSID = 37) {
+function decodeRow(buf, startOffset, descriptors, serverCCSID = 37, opts) {
   const row = {};
   let offset = startOffset;
   for (const desc of descriptors) {
@@ -11059,31 +11096,31 @@ function decodeRow(buf, startOffset, descriptors, serverCCSID = 37) {
         row[desc.name || `col${desc.index}`] = null;
         const handler = getTypeHandler(desc.sqlType);
         if (handler) {
-          const skip = handler.decode(buf, offset, desc, serverCCSID);
+          const skip = handler.decode(buf, offset, desc, serverCCSID, opts);
           offset += skip.bytesRead;
         }
         continue;
       }
     }
-    const { value, bytesRead } = decodeValue(buf, offset, desc, serverCCSID);
+    const { value, bytesRead } = decodeValue(buf, offset, desc, serverCCSID, opts);
     row[desc.name || `col${desc.index}`] = value;
     offset += bytesRead;
   }
   return { row, bytesRead: offset - startOffset };
 }
-function decodeRows(buf, startOffset, descriptors, rowCount, serverCCSID = 37) {
+function decodeRows(buf, startOffset, descriptors, rowCount, serverCCSID = 37, opts) {
   const rows = [];
   let offset = startOffset;
   for (let i = 0;i < rowCount; i++) {
     if (offset >= buf.length)
       break;
-    const { row, bytesRead } = decodeRow(buf, offset, descriptors, serverCCSID);
+    const { row, bytesRead } = decodeRow(buf, offset, descriptors, serverCCSID, opts);
     rows.push(row);
     offset += bytesRead;
   }
   return rows;
 }
-function decodeResultData(buf, descriptors, serverCCSID = 37) {
+function decodeResultData(buf, descriptors, serverCCSID = 37, opts) {
   if (!buf || buf.length < 14)
     return [];
   const rowCount = buf.readInt32BE(4);
@@ -11195,7 +11232,7 @@ function decodeResultData(buf, descriptors, serverCCSID = 37) {
         row[name] = null;
       } else if (handler) {
         const valOffset = rowDataOffset + colOffsets[c];
-        row[name] = handler.decode(buf, valOffset, descriptors[c], serverCCSID).value;
+        row[name] = handler.decode(buf, valOffset, descriptors[c], serverCCSID, opts).value;
       } else {
         row[name] = null;
       }
@@ -11348,12 +11385,14 @@ function generateCursorName(rpbId) {
 class StatementManager {
   #connection;
   #serverCCSID;
+  #bigintMode;
   #cursorManager;
   #statements;
   #packageManager;
   constructor(connection, cursorManager, opts = {}) {
     this.#connection = connection;
     this.#serverCCSID = opts.serverCCSID ?? 37;
+    this.#bigintMode = opts.bigintMode ?? "auto";
     this.#cursorManager = cursorManager;
     this.#statements = new Map;
     this.#packageManager = opts.packageManager ?? null;
@@ -11583,7 +11622,7 @@ class StatementManager {
       this.#cursorManager.registerCursor(stmt.rpbId, openColumnDescriptors);
       const rows = [];
       for (const dataBuf of reply2.rowDataBuffers) {
-        const decoded = decodeResultData(dataBuf, openColumnDescriptors, this.#serverCCSID);
+        const decoded = decodeResultData(dataBuf, openColumnDescriptors, this.#serverCCSID, { bigintMode: this.#bigintMode });
         rows.push(...decoded);
       }
       return {
@@ -11617,7 +11656,7 @@ class StatementManager {
       }
       let parameterRow = null;
       if (reply2.rowDataBuffers.length > 0) {
-        const decoded = decodeResultData(reply2.rowDataBuffers[0], activeParamDescriptors, this.#serverCCSID);
+        const decoded = decodeResultData(reply2.rowDataBuffers[0], activeParamDescriptors, this.#serverCCSID, { bigintMode: this.#bigintMode });
         if (decoded.length > 0)
           parameterRow = decoded[0];
       }
@@ -11645,7 +11684,7 @@ class StatementManager {
           const buf = tail[i];
           let descriptors = decodedFormats[i] || decodedFormats[0] || null;
           if (descriptors && descriptors.length > 0) {
-            const rows = decodeResultData(buf, descriptors, this.#serverCCSID);
+            const rows = decodeResultData(buf, descriptors, this.#serverCCSID, { bigintMode: this.#bigintMode });
             resultSetGroups.push({ rows, descriptors });
           } else {
             tailExtras.push(buf);
@@ -12231,10 +12270,12 @@ class StatementManager {
 class CursorManager {
   #connection;
   #serverCCSID;
+  #bigintMode;
   #cursors;
   constructor(connection, opts = {}) {
     this.#connection = connection;
     this.#serverCCSID = opts.serverCCSID ?? 37;
+    this.#bigintMode = opts.bigintMode ?? "auto";
     this.#cursors = new Map;
     this.metrics = {
       fetchCalls: 0,
@@ -12276,7 +12317,7 @@ class CursorManager {
     }
     const rows = [];
     for (const dataBuf of reply.rowDataBuffers) {
-      const decoded = decodeResultData(dataBuf, cursor.descriptors, this.#serverCCSID);
+      const decoded = decodeResultData(dataBuf, cursor.descriptors, this.#serverCCSID, { bigintMode: this.#bigintMode });
       rows.push(...decoded);
     }
     cursor.totalFetched += rows.length;
@@ -13089,6 +13130,7 @@ function matchKeywordAt(text, start, keyword) {
 }
 
 // src/db/engine/DbConnection.js
+init_int64();
 var DB_STATE = Symbol.for("js400.dbState");
 
 class DbConnection {
@@ -13199,6 +13241,7 @@ class DbConnection {
     Trace.log(Trace.JDBC, `Database connected: CCSID=${this.#serverCCSID} DSLevel=${this.#serverDatastreamLevel} funcLevel=${this.#serverFunctionalLevel} jobId=${this.#serverJobIdentifier || "<unknown>"}`);
     const managerOpts = {
       serverCCSID: this.#serverCCSID,
+      bigintMode: normalizeBigintMode(this.#properties.bigintMode),
       holdIndicator: this.#explicitHoldIndicator(this.#userOpts),
       extendedDynamic: this.#explicitBoolean(this.#userOpts, "extendedDynamic"),
       packageCache: this.#explicitBoolean(this.#userOpts, "packageCache"),
@@ -18784,6 +18827,7 @@ function buildConnectOptions(options) {
     "timeFormat",
     "timeSeparator",
     "decimalSeparator",
+    "bigintMode",
     "isolation",
     "autoCommit",
     "trueAutoCommit",

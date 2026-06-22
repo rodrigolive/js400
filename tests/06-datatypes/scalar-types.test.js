@@ -88,21 +88,42 @@ describe('AS400Bin4', () => {
 describe('AS400Bin8', () => {
   const bin8 = new AS400Bin8();
 
-  it('returns BigInt', () => {
+  it('returns Number when safe (auto default)', () => {
     const val = bin8.fromBuffer(bin8.toBuffer(42));
+    expect(typeof val).toBe('number');
+    expect(val).toBe(42);
+  });
+
+  it('keeps BigInt for values beyond MAX_SAFE_INTEGER (auto)', () => {
+    const big = 9007199254740993n; // 2^53 + 1
+    const buf = bin8.toBuffer(big);
+    const val = bin8.fromBuffer(buf);
+    expect(typeof val).toBe('bigint');
+    expect(val).toBe(big);
+  });
+
+  it('keeps BigInt for negative values beyond MAX_SAFE_INTEGER (auto)', () => {
+    const val = -9007199254740993n;
+    expect(bin8.fromBuffer(bin8.toBuffer(val))).toBe(val);
+  });
+
+  it('returns Number at the safe-integer boundary 2^53-1 (auto)', () => {
+    const max = 9007199254740991n;
+    const val = bin8.fromBuffer(bin8.toBuffer(max));
+    expect(typeof val).toBe('number');
+    expect(val).toBe(9007199254740991);
+  });
+
+  it('always returns BigInt when constructed with { bigint: "bigint" }', () => {
+    const b = new AS400Bin8({ bigint: 'bigint' });
+    const val = b.fromBuffer(b.toBuffer(42));
     expect(typeof val).toBe('bigint');
     expect(val).toBe(42n);
   });
 
-  it('handles values beyond MAX_SAFE_INTEGER', () => {
-    const big = 9007199254740993n;
-    const buf = bin8.toBuffer(big);
-    expect(bin8.fromBuffer(buf)).toBe(big);
-  });
-
-  it('handles negative BigInt', () => {
-    const val = -9007199254740993n;
-    expect(bin8.fromBuffer(bin8.toBuffer(val))).toBe(val);
+  it('returns a decimal string with { bigint: "string" }', () => {
+    const b = new AS400Bin8({ bigint: 'string' });
+    expect(b.fromBuffer(b.toBuffer(9007199254740993n))).toBe('9007199254740993');
   });
 
   it('has correct byteLength', () => {
@@ -140,14 +161,24 @@ describe('AS400UnsignedBin4', () => {
 describe('AS400UnsignedBin8', () => {
   const u8 = new AS400UnsignedBin8();
 
-  it('returns BigInt', () => {
+  it('returns Number when safe (auto default)', () => {
     const val = u8.fromBuffer(u8.toBuffer(0));
-    expect(typeof val).toBe('bigint');
+    expect(typeof val).toBe('number');
+    expect(val).toBe(0);
   });
 
-  it('handles max uint64', () => {
+  it('keeps BigInt for max uint64 (auto)', () => {
     const max = 18446744073709551615n;
-    expect(u8.fromBuffer(u8.toBuffer(max))).toBe(max);
+    const val = u8.fromBuffer(u8.toBuffer(max));
+    expect(typeof val).toBe('bigint');
+    expect(val).toBe(max);
+  });
+
+  it('always returns BigInt when constructed with { bigint: "bigint" }', () => {
+    const b = new AS400UnsignedBin8({ bigint: 'bigint' });
+    const val = b.fromBuffer(b.toBuffer(0));
+    expect(typeof val).toBe('bigint');
+    expect(val).toBe(0n);
   });
 });
 

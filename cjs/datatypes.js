@@ -2559,8 +2559,33 @@ class AS400Bin4 extends AS400DataType {
     return buf.readInt32BE(offset);
   }
 }
+// src/db/types/int64.js
+function coerceInt64(raw, mode) {
+  switch (mode) {
+    case "bigint":
+      return raw;
+    case "number":
+      return Number(raw);
+    case "string":
+      return raw.toString();
+    case "auto":
+    default: {
+      const n = Number(raw);
+      return raw === BigInt(n) ? n : raw;
+    }
+  }
+}
+var BIGINT_MODES = new Set(["auto", "number", "bigint", "string"]);
+function normalizeBigintMode(mode) {
+  return BIGINT_MODES.has(mode) ? mode : "auto";
+}
+
 // src/datatypes/AS400Bin8.js
 class AS400Bin8 extends AS400DataType {
+  constructor(opts = {}) {
+    super();
+    this.mode = normalizeBigintMode(opts.bigint);
+  }
   get typeId() {
     return TYPE_BIN8;
   }
@@ -2573,7 +2598,7 @@ class AS400Bin8 extends AS400DataType {
     return buf;
   }
   fromBuffer(buf, offset = 0) {
-    return buf.readBigInt64BE(offset);
+    return coerceInt64(buf.readBigInt64BE(offset), this.mode);
   }
 }
 // src/datatypes/AS400UnsignedBin1.js
@@ -2629,6 +2654,10 @@ class AS400UnsignedBin4 extends AS400DataType {
 }
 // src/datatypes/AS400UnsignedBin8.js
 class AS400UnsignedBin8 extends AS400DataType {
+  constructor(opts = {}) {
+    super();
+    this.mode = normalizeBigintMode(opts.bigint);
+  }
   get typeId() {
     return TYPE_UBIN8;
   }
@@ -2641,7 +2670,7 @@ class AS400UnsignedBin8 extends AS400DataType {
     return buf;
   }
   fromBuffer(buf, offset = 0) {
-    return buf.readBigUInt64BE(offset);
+    return coerceInt64(buf.readBigUInt64BE(offset), this.mode);
   }
 }
 // src/datatypes/AS400Float4.js

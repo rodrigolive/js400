@@ -49,6 +49,16 @@ describe('validateProperties', () => {
     expect(() => validateProperties({ blockSize: 999 })).toThrow('Invalid blockSize');
   });
 
+  test('throws on invalid bigintMode', () => {
+    expect(() => validateProperties({ bigintMode: 'long' })).toThrow('Invalid bigintMode');
+  });
+
+  test('accepts all valid bigintMode values', () => {
+    for (const mode of ['auto', 'number', 'bigint', 'string']) {
+      expect(validateProperties({ bigintMode: mode })).toEqual([]);
+    }
+  });
+
   test('accepts all valid isolation levels', () => {
     const levels = ['none', 'read-uncommitted', 'read-committed', 'repeatable-read', 'serializable'];
     for (const level of levels) {

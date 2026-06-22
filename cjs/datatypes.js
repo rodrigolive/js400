@@ -2571,7 +2571,7 @@ function coerceInt64(raw, mode) {
     case "auto":
     default: {
       const n = Number(raw);
-      return raw === BigInt(n) ? n : raw;
+      return Number.isSafeInteger(n) ? n : raw;
     }
   }
 }

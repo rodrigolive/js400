@@ -34,6 +34,13 @@ describe('coerceInt64 — auto (default)', () => {
     expect(v).toBe(OVER_SAFE);
   });
 
+  test('boundary is monotonic: 2^53 and 2^53+2 stay BigInt', () => {
+    // Both are exactly representable as Number but are NOT safe integers,
+    // so the safe-integer boundary keeps them BigInt (no zigzag).
+    expect(typeof coerceInt64(9007199254740992n, 'auto')).toBe('bigint'); // 2^53
+    expect(typeof coerceInt64(9007199254740994n, 'auto')).toBe('bigint'); // 2^53 + 2
+  });
+
   test('keeps BigInt for negative values beyond the safe range', () => {
     expect(coerceInt64(NEG_OVER_SAFE, 'auto')).toBe(NEG_OVER_SAFE);
   });

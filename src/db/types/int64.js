@@ -18,15 +18,18 @@
  * Coerce a raw int64 `BigInt` to the configured representation.
  *
  * Modes:
- *   'auto'   (default) — Number when it round-trips losslessly, else BigInt
+ *   'auto'   (default) — Number when it is a JS safe integer, else BigInt
  *   'number'           — always Number (lossy beyond 2^53-1)
  *   'bigint'           — always native BigInt (full precision)
  *   'string'           — always a decimal string
  *
  * Works for both signed (readBigInt64BE) and unsigned (readBigUInt64BE)
- * sources: the caller passes the BigInt, and any value with magnitude >= 2^53
- * fails the round-trip check and stays BigInt under 'auto'. Unknown modes fall
- * through to 'auto' so a bad option can never throw on the decode hot path.
+ * sources: the caller passes the BigInt, and any value with magnitude > 2^53-1
+ * fails the safe-integer check and stays BigInt under 'auto'. The boundary is
+ * `Number.isSafeInteger` (|value| <= 2^53-1) rather than mere exact
+ * representability, so it is monotonic — there is no value above the boundary
+ * that decodes back to Number. Unknown modes fall through to 'auto' so a bad
+ * option can never throw on the decode hot path.
  *
  * @param {bigint} raw - the value read off the wire
  * @param {('auto'|'number'|'bigint'|'string')} [mode='auto']
@@ -40,7 +43,7 @@ export function coerceInt64(raw, mode) {
     case 'auto':
     default: {
       const n = Number(raw);
-      return raw === BigInt(n) ? n : raw;
+      return Number.isSafeInteger(n) ? n : raw;
     }
   }
 }

@@ -40,6 +40,8 @@ const JDBC_PROP_MAP = {
   'package cache':     'packageCache',
   'translate binary':  'translateBinary',
   'true autocommit':   'trueAutoCommit',
+  'bigintmode':        'bigintMode',
+  'bigint mode':       'bigintMode',
 };
 
 /**

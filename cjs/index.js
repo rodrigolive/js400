@@ -7131,7 +7131,7 @@ function coerceInt64(raw, mode) {
     case "auto":
     default: {
       const n = Number(raw);
-      return raw === BigInt(n) ? n : raw;
+      return Number.isSafeInteger(n) ? n : raw;
     }
   }
 }
@@ -24400,7 +24400,9 @@ var JDBC_PROP_MAP = {
   "package library": "packageLibrary",
   "package cache": "packageCache",
   "translate binary": "translateBinary",
-  "true autocommit": "trueAutoCommit"
+  "true autocommit": "trueAutoCommit",
+  bigintmode: "bigintMode",
+  "bigint mode": "bigintMode"
 };
 function normalizeDateFormat(val) {
   const v = val.toLowerCase().replace(/^\*/, "");

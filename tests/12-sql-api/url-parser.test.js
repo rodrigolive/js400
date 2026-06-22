@@ -57,6 +57,12 @@ describe('parseJdbcUrl', () => {
     expect(result.naming).toBe('system');
   });
 
+  test('maps bigintMode case-insensitively', () => {
+    expect(parseJdbcUrl('jdbc:as400://h;bigintMode=string').bigintMode).toBe('string');
+    expect(parseJdbcUrl('jdbc:as400://h;bigintmode=bigint').bigintMode).toBe('bigint');
+    expect(parseJdbcUrl('jdbc:as400://h;bigint mode=number').bigintMode).toBe('number');
+  });
+
   test('normalizes date format values', () => {
     const r1 = parseJdbcUrl('jdbc:as400://h;date format=iso');
     expect(r1.dateFormat).toBe('*ISO');

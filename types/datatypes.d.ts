@@ -2,11 +2,15 @@ export class AS400DataType {}
 export class AS400Bin1 {}
 export class AS400Bin2 {}
 export class AS400Bin4 {}
-export class AS400Bin8 {}
+export class AS400Bin8 {
+  constructor(opts?: { bigint?: 'auto' | 'number' | 'bigint' | 'string' });
+}
 export class AS400UnsignedBin1 {}
 export class AS400UnsignedBin2 {}
 export class AS400UnsignedBin4 {}
-export class AS400UnsignedBin8 {}
+export class AS400UnsignedBin8 {
+  constructor(opts?: { bigint?: 'auto' | 'number' | 'bigint' | 'string' });
+}
 export class AS400Float4 {}
 export class AS400Float8 {}
 export class AS400PackedDecimal {}

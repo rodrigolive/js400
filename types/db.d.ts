@@ -21,6 +21,8 @@ export interface ConnectOptions {
   packageCriteria?: string;
   packageError?: string;
   holdStatements?: boolean;
+  /** BIGINT/int64 result representation. Defaults to 'auto'. */
+  bigintMode?: 'auto' | 'number' | 'bigint' | 'string';
   isolation?: string;
   dateFormat?: string;
   dateSeparator?: string;

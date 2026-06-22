@@ -15,11 +15,13 @@ import { decodeResultData } from '../types/factory.js';
 export class CursorManager {
   #connection;
   #serverCCSID;
+  #bigintMode;
   #cursors;
 
   constructor(connection, opts = {}) {
     this.#connection = connection;
     this.#serverCCSID = opts.serverCCSID ?? 37;
+    this.#bigintMode = opts.bigintMode ?? 'auto';
     this.#cursors = new Map();
     // Lightweight protocol-activity counters. Read via `metrics`;
     // reset via `resetMetrics()`. Zero cost when unread — a handful
@@ -71,7 +73,7 @@ export class CursorManager {
 
     const rows = [];
     for (const dataBuf of reply.rowDataBuffers) {
-      const decoded = decodeResultData(dataBuf, cursor.descriptors, this.#serverCCSID);
+      const decoded = decodeResultData(dataBuf, cursor.descriptors, this.#serverCCSID, { bigintMode: this.#bigintMode });
       rows.push(...decoded);
     }
 

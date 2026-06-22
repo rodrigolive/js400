@@ -5,6 +5,8 @@
  * @module db/properties
  */
 
+import { BIGINT_MODES } from './types/int64.js';
+
 /** Naming conventions for SQL object resolution. */
 export const Naming = Object.freeze({
   SQL:    'sql',    // schema.table
@@ -107,6 +109,7 @@ export const defaultProperties = Object.freeze({
   lazyClose:        false,
   translateBinary:  false,
   trueAutoCommit:   false,
+  bigintMode:       'auto',
 });
 
 /** Legacy export for backward compatibility. */
@@ -130,6 +133,8 @@ const KNOWN_PROPERTIES = new Set([
   'extendedDynamic', 'sqlPackage', 'packageLibrary', 'packageCache', 'packageError',
   'translateHex', 'holdStatements',
   'blockCriteria',
+  // BIGINT/int64 result representation: 'auto' | 'number' | 'bigint' | 'string'.
+  'bigintMode',
 ]);
 
 /** Valid values for enum-style properties. */
@@ -191,6 +196,12 @@ export function validateProperties(props) {
     && !VALID_PACKAGE_ERROR.has(String(props.packageError).toLowerCase())) {
     throw new Error(
       `Invalid packageError: "${props.packageError}". Expected one of: ${[...VALID_PACKAGE_ERROR].join(', ')}`,
+    );
+  }
+
+  if (props.bigintMode !== undefined && !BIGINT_MODES.has(props.bigintMode)) {
+    throw new Error(
+      `Invalid bigintMode: "${props.bigintMode}". Expected one of: ${[...BIGINT_MODES].join(', ')}`,
     );
   }
 

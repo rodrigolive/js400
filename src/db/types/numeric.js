@@ -7,6 +7,8 @@
  * @module db/types/numeric
  */
 
+import { coerceInt64 } from './int64.js';
+
 function decodeSmallint(buf, offset, desc) {
   return { value: buf.readInt16BE(offset), bytesRead: 2 };
 }
@@ -37,8 +39,9 @@ function encodeIntegerInto(value, buf, offset, fieldLen) {
   return 4;
 }
 
-function decodeBigint(buf, offset, desc) {
-  return { value: buf.readBigInt64BE(offset), bytesRead: 8 };
+function decodeBigint(buf, offset, desc, serverCCSID, opts) {
+  const raw = buf.readBigInt64BE(offset);
+  return { value: coerceInt64(raw, opts && opts.bigintMode), bytesRead: 8 };
 }
 
 function encodeBigint(value, desc) {

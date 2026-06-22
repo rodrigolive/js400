@@ -56,14 +56,15 @@ export function getTypeHandler(sqlType) {
  * @param {number} offset - byte offset to start reading
  * @param {object} descriptor - column descriptor from DBDescriptors
  * @param {number} [serverCCSID=37]
+ * @param {object} [opts] - decode options (e.g. { bigintMode })
  * @returns {{ value: any, bytesRead: number }}
  */
-export function decodeValue(buf, offset, descriptor, serverCCSID = 37) {
+export function decodeValue(buf, offset, descriptor, serverCCSID = 37, opts) {
   const handler = getTypeHandler(descriptor.sqlType);
   if (!handler) {
     return { value: null, bytesRead: descriptor.length || 0 };
   }
-  return handler.decode(buf, offset, descriptor, serverCCSID);
+  return handler.decode(buf, offset, descriptor, serverCCSID, opts);
 }
 
 /**
@@ -122,9 +123,10 @@ export function encodeValueInto(value, buf, offset, fieldLen, descriptor, server
  * @param {number} startOffset
  * @param {object[]} descriptors - column descriptors array
  * @param {number} [serverCCSID=37]
+ * @param {object} [opts] - decode options (e.g. { bigintMode })
  * @returns {{ row: object, bytesRead: number }}
  */
-export function decodeRow(buf, startOffset, descriptors, serverCCSID = 37) {
+export function decodeRow(buf, startOffset, descriptors, serverCCSID = 37, opts) {
   const row = {};
   let offset = startOffset;
 
@@ -136,17 +138,17 @@ export function decodeRow(buf, startOffset, descriptors, serverCCSID = 37) {
       offset += 2;
       if (nullInd === -1) {
         row[desc.name || `col${desc.index}`] = null;
-        // Skip past the data bytes
+        // Skip past the data bytes (value discarded; only bytesRead matters)
         const handler = getTypeHandler(desc.sqlType);
         if (handler) {
-          const skip = handler.decode(buf, offset, desc, serverCCSID);
+          const skip = handler.decode(buf, offset, desc, serverCCSID, opts);
           offset += skip.bytesRead;
         }
         continue;
       }
     }
 
-    const { value, bytesRead } = decodeValue(buf, offset, desc, serverCCSID);
+    const { value, bytesRead } = decodeValue(buf, offset, desc, serverCCSID, opts);
     row[desc.name || `col${desc.index}`] = value;
     offset += bytesRead;
   }
@@ -162,15 +164,16 @@ export function decodeRow(buf, startOffset, descriptors, serverCCSID = 37) {
  * @param {object[]} descriptors
  * @param {number} rowCount
  * @param {number} [serverCCSID=37]
+ * @param {object} [opts] - decode options (e.g. { bigintMode })
  * @returns {object[]}
  */
-export function decodeRows(buf, startOffset, descriptors, rowCount, serverCCSID = 37) {
+export function decodeRows(buf, startOffset, descriptors, rowCount, serverCCSID = 37, opts) {
   const rows = [];
   let offset = startOffset;
 
   for (let i = 0; i < rowCount; i++) {
     if (offset >= buf.length) break;
-    const { row, bytesRead } = decodeRow(buf, offset, descriptors, serverCCSID);
+    const { row, bytesRead } = decodeRow(buf, offset, descriptors, serverCCSID, opts);
     rows.push(row);
     offset += bytesRead;
   }
@@ -207,9 +210,10 @@ export function decodeRows(buf, startOffset, descriptors, rowCount, serverCCSID 
  * @param {Buffer} buf - raw result data code point data (after LL/CP)
  * @param {object[]} descriptors - column descriptors from prepare
  * @param {number} [serverCCSID=37]
+ * @param {object} [opts] - decode options (e.g. { bigintMode })
  * @returns {object[]}
  */
-export function decodeResultData(buf, descriptors, serverCCSID = 37) {
+export function decodeResultData(buf, descriptors, serverCCSID = 37, opts) {
   if (!buf || buf.length < 14) return [];
 
   const rowCount = buf.readInt32BE(4);
@@ -305,7 +309,7 @@ export function decodeResultData(buf, descriptors, serverCCSID = 37) {
         row[name] = null;
       } else if (handler) {
         const valOffset = rowDataOffset + colOffsets[c];
-        row[name] = handler.decode(buf, valOffset, descriptors[c], serverCCSID).value;
+        row[name] = handler.decode(buf, valOffset, descriptors[c], serverCCSID, opts).value;
       } else {
         row[name] = null;
       }

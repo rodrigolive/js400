@@ -115,6 +115,8 @@ function buildConnectOptions(options) {
     // Date/time/decimal formatting.
     'dateFormat', 'dateSeparator', 'timeFormat', 'timeSeparator',
     'decimalSeparator',
+    // BIGINT/int64 result representation.
+    'bigintMode',
     // Transaction behaviour.
     'isolation', 'autoCommit', 'trueAutoCommit', 'holdStatements',
     // Performance / blocking knobs.

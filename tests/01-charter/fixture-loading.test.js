@@ -6,7 +6,7 @@
 import { describe, test, expect } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { DataStream } from '../../src/transport/datastream.js';
+import { DataStream } from '../../src/transport/DataStream.js';
 import { SignonExchangeRep } from '../../src/auth/protocol/SignonExchangeRep.js';
 
 const FIXTURES = join(import.meta.dirname, '..', 'fixtures');

@@ -71,7 +71,7 @@
   "scripts": {
     "build:cjs": "node scripts/build-cjs.cjs",
     "prepublishOnly": "node scripts/build-cjs.cjs",
-    "test": "node --import ./tests/bun-test-shim.js --test tests/",
+    "test": "node --import ./tests/bun-test-shim.js --test $(find tests -name '*.test.js')",
     "test:bun": "bun test tests/",
     "test:integration": "bun test tests/integration/",
     "validate": "bun run src/index.js"
